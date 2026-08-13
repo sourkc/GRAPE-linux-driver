@@ -8,11 +8,14 @@
 #include "grape/grape.h"
 
 #define GFXLINK_TIMEOUT_MS 3000
+#define GFXLINK_RESOURCE_MAX_COMMIT_ATTEMPTS 4U
 
 struct grape_device {
     libusb_context *usb;
     libusb_device_handle *handle;
     uint32_t sequence;
+    uint8_t tx_buffer[sizeof(gfxlink_header_t) + GFXLINK_MAX_PAYLOAD];
+    uint8_t rx_buffer[sizeof(gfxlink_header_t) + GFXLINK_MAX_PAYLOAD];
 };
 
 static uint32_t float_bits(float value)
@@ -20,6 +23,47 @@ static uint32_t float_bits(float value)
     uint32_t bits;
     memcpy(&bits, &value, sizeof(bits));
     return htole32(bits);
+}
+
+static uint32_t s_crc32_table[256];
+static bool s_crc32_table_ready;
+
+static void crc32_init_table(void)
+{
+    if (s_crc32_table_ready) {
+        return;
+    }
+    for (uint32_t i = 0U; i < 256U; ++i) {
+        uint32_t crc = i;
+        for (uint32_t bit = 0U; bit < 8U; ++bit) {
+            crc = (crc >> 1U) ^ ((crc & 1U) ? 0xEDB88320U : 0U);
+        }
+        s_crc32_table[i] = crc;
+    }
+    s_crc32_table_ready = true;
+}
+
+static uint32_t crc32_ieee(const uint8_t *data, size_t size)
+{
+    crc32_init_table();
+    uint32_t crc = 0xFFFFFFFFU;
+    for (size_t i = 0U; i < size; ++i) {
+        crc = s_crc32_table[(crc ^ data[i]) & 0xFFU] ^ (crc >> 8U);
+    }
+    return crc ^ 0xFFFFFFFFU;
+}
+
+static bool bitmap_test(const uint8_t *bitmap, uint32_t index)
+{
+    return (bitmap[index >> 3U] & (uint8_t)(1U << (index & 7U))) != 0U;
+}
+
+static void advance_sequence(grape_device_t *device)
+{
+    device->sequence++;
+    if (device->sequence == 0U) {
+        device->sequence = 1U;
+    }
 }
 
 static int remote_status_to_result(int32_t status)
@@ -95,6 +139,77 @@ static int open_grape_device(libusb_context *usb, libusb_device_handle **out_dev
     return result;
 }
 
+static int send_packet_parts(grape_device_t *device,
+                             uint8_t opcode,
+                             uint16_t flags,
+                             const void *prefix,
+                             uint32_t prefix_size,
+                             const void *data,
+                             uint32_t data_size,
+                             uint32_t *out_sequence)
+{
+    uint32_t payload_size = prefix_size + data_size;
+    if (!device || !device->handle ||
+        payload_size > GFXLINK_MAX_PAYLOAD ||
+        (prefix_size > 0U && !prefix) ||
+        (data_size > 0U && !data)) {
+        return GRAPE_ERROR_INVALID_ARGUMENT;
+    }
+
+    uint32_t sequence = device->sequence;
+    gfxlink_header_t header = {
+        .magic = htole32(GFXLINK_MAGIC),
+        .version = GFXLINK_PROTOCOL_VERSION,
+        .opcode = opcode,
+        .flags = htole16(flags),
+        .sequence = htole32(sequence),
+        .payload_size = htole32(payload_size),
+    };
+
+    uint8_t *tx = device->tx_buffer;
+    memcpy(tx, &header, sizeof(header));
+    uint32_t offset = sizeof(header);
+    if (prefix_size > 0U) {
+        memcpy(tx + offset, prefix, prefix_size);
+        offset += prefix_size;
+    }
+    if (data_size > 0U) {
+        memcpy(tx + offset, data, data_size);
+    }
+
+    int tx_size = (int)(sizeof(header) + payload_size);
+    int transferred = 0;
+    int ret = libusb_bulk_transfer(
+        device->handle,
+        GFXLINK_USB_EP_OUT,
+        tx,
+        tx_size,
+        &transferred,
+        GFXLINK_TIMEOUT_MS
+    );
+    if (ret != 0 || transferred != tx_size) {
+        return GRAPE_ERROR_USB;
+    }
+
+    if (out_sequence) {
+        *out_sequence = sequence;
+    }
+    advance_sequence(device);
+    return GRAPE_OK;
+}
+
+static int send_packet(grape_device_t *device,
+                       uint8_t opcode,
+                       uint16_t flags,
+                       const void *payload,
+                       uint32_t payload_size,
+                       uint32_t *out_sequence)
+{
+    return send_packet_parts(device, opcode, flags,
+                             payload, payload_size, NULL, 0U,
+                             out_sequence);
+}
+
 static int request(grape_device_t *device,
                    uint8_t opcode,
                    const void *payload,
@@ -103,63 +218,28 @@ static int request(grape_device_t *device,
                    uint32_t response_capacity,
                    uint32_t *response_size)
 {
-    if (!device || !device->handle || !response_size ||
-        payload_size > GFXLINK_MAX_PAYLOAD ||
-        (payload_size > 0U && !payload)) {
+    if (!device || !response_size) {
         return GRAPE_ERROR_INVALID_ARGUMENT;
     }
 
-    size_t tx_size = sizeof(gfxlink_header_t) + payload_size;
-    uint8_t *tx = malloc(tx_size);
-    uint8_t *rx = malloc(sizeof(gfxlink_header_t) + GFXLINK_MAX_PAYLOAD);
-    if (!tx || !rx) {
-        free(tx);
-        free(rx);
-        return GRAPE_ERROR_NO_MEMORY;
-    }
+    const size_t rx_capacity = sizeof(gfxlink_header_t) + GFXLINK_MAX_PAYLOAD;
+    uint8_t *rx = device->rx_buffer;
 
-    gfxlink_header_t header = {
-        .magic = htole32(GFXLINK_MAGIC),
-        .version = GFXLINK_PROTOCOL_VERSION,
-        .opcode = opcode,
-        .flags = htole16(0),
-        .sequence = htole32(device->sequence),
-        .payload_size = htole32(payload_size),
-    };
-
-    memcpy(tx, &header, sizeof(header));
-    if (payload_size > 0U) {
-        memcpy(tx + sizeof(header), payload, payload_size);
-    }
-
-    int transferred = 0;
-    int ret = libusb_bulk_transfer(
-        device->handle,
-        GFXLINK_USB_EP_OUT,
-        tx,
-        (int)tx_size,
-        &transferred,
-        GFXLINK_TIMEOUT_MS
-    );
-    free(tx);
-
-    if (ret != 0 || transferred != (int)tx_size) {
-        free(rx);
-        return GRAPE_ERROR_USB;
+    uint32_t sequence = 0U;
+    int result = send_packet(device, opcode, 0U, payload, payload_size, &sequence);
+    if (result != GRAPE_OK) {
+        return result;
     }
 
     size_t received = 0U;
     size_t expected = 0U;
-    const size_t rx_capacity = sizeof(gfxlink_header_t) + GFXLINK_MAX_PAYLOAD;
-
     while (expected == 0U || received < expected) {
         if (received == rx_capacity) {
-            free(rx);
             return GRAPE_ERROR_PROTOCOL;
         }
 
-        transferred = 0;
-        ret = libusb_bulk_transfer(
+        int transferred = 0;
+        int ret = libusb_bulk_transfer(
             device->handle,
             GFXLINK_USB_EP_IN,
             rx + received,
@@ -168,51 +248,38 @@ static int request(grape_device_t *device,
             GFXLINK_TIMEOUT_MS
         );
         if (ret != 0 || transferred <= 0) {
-            free(rx);
             return GRAPE_ERROR_USB;
         }
 
         received += (size_t)transferred;
-
         if (expected == 0U && received >= sizeof(gfxlink_header_t)) {
             gfxlink_header_t incoming;
             memcpy(&incoming, rx, sizeof(incoming));
-
             uint32_t incoming_size = le32toh(incoming.payload_size);
             if (le32toh(incoming.magic) != GFXLINK_MAGIC ||
                 incoming.version != GFXLINK_PROTOCOL_VERSION ||
                 incoming.opcode != opcode ||
                 (le16toh(incoming.flags) & GFXLINK_FLAG_RESPONSE) == 0U ||
-                le32toh(incoming.sequence) != device->sequence ||
+                le32toh(incoming.sequence) != sequence ||
                 incoming_size > GFXLINK_MAX_PAYLOAD) {
-                free(rx);
                 return GRAPE_ERROR_PROTOCOL;
             }
             expected = sizeof(gfxlink_header_t) + incoming_size;
         }
 
         if (expected != 0U && received > expected) {
-            free(rx);
             return GRAPE_ERROR_PROTOCOL;
         }
     }
 
     uint32_t size = (uint32_t)(expected - sizeof(gfxlink_header_t));
     if (size > response_capacity || (size > 0U && !response)) {
-        free(rx);
         return GRAPE_ERROR_PROTOCOL;
     }
-
     if (size > 0U) {
         memcpy(response, rx + sizeof(gfxlink_header_t), size);
     }
-    free(rx);
-
     *response_size = size;
-    device->sequence++;
-    if (device->sequence == 0U) {
-        device->sequence = 1U;
-    }
     return GRAPE_OK;
 }
 
@@ -304,6 +371,8 @@ const char *grape_error_name(int result)
             return "permission denied opening GRAPE";
         case GRAPE_ERROR_USB:
             return "USB transport error";
+        case GRAPE_ERROR_RETRY_LIMIT:
+            return "GRAPE resource upload retry limit reached";
         case GRAPE_ERROR_REMOTE_BASE + GFXLINK_STATUS_INVALID_PACKET:
             return "GRAPE rejected invalid packet";
         case GRAPE_ERROR_REMOTE_BASE + GFXLINK_STATUS_UNSUPPORTED:
@@ -320,6 +389,8 @@ const char *grape_error_name(int result)
             return "GRAPE internal error";
         case GRAPE_ERROR_REMOTE_BASE + GFXLINK_STATUS_INCOMPLETE:
             return "GRAPE resource upload incomplete";
+        case GRAPE_ERROR_REMOTE_BASE + GFXLINK_STATUS_CHECKSUM_MISMATCH:
+            return "GRAPE resource checksum mismatch";
         default:
             return "unknown GRAPE error";
     }
@@ -480,9 +551,11 @@ int grape_surface_destroy(grape_device_t *device, grape_handle_t handle)
 int grape_resource_create(grape_device_t *device,
                           gfxlink_resource_kind_t kind,
                           uint32_t total_size,
-                          grape_handle_t *out_handle)
+                          grape_resource_info_t *out_info)
 {
-    if (!out_handle || total_size == 0U || total_size > GFXLINK_MAX_RESOURCE_SIZE) {
+    if (!device || !out_info ||
+        kind > GFXLINK_RESOURCE_SVG ||
+        total_size == 0U || total_size > GFXLINK_MAX_RESOURCE_SIZE) {
         return GRAPE_ERROR_INVALID_ARGUMENT;
     }
 
@@ -509,8 +582,40 @@ int grape_resource_create(grape_device_t *device,
         return result;
     }
 
-    *out_handle = le32toh(response.handle);
+    out_info->handle = le32toh(response.handle);
+    out_info->chunk_size = le32toh(response.chunk_size);
+    out_info->chunk_count = le32toh(response.chunk_count);
+    if (out_info->handle == 0U ||
+        out_info->chunk_size != GFXLINK_RESOURCE_CHUNK_SIZE ||
+        out_info->chunk_count == 0U ||
+        out_info->chunk_count > GFXLINK_RESOURCE_MAX_CHUNKS) {
+        return GRAPE_ERROR_PROTOCOL;
+    }
     return GRAPE_OK;
+}
+
+static int resource_write_chunk(grape_device_t *device,
+                                grape_handle_t handle,
+                                uint32_t chunk_index,
+                                const void *data,
+                                uint32_t size)
+{
+    if (!device || handle == 0U || !data || size == 0U ||
+        size > GFXLINK_RESOURCE_CHUNK_SIZE ||
+        chunk_index >= GFXLINK_RESOURCE_MAX_CHUNKS) {
+        return GRAPE_ERROR_INVALID_ARGUMENT;
+    }
+
+    gfxlink_resource_write_request_t request_header = {
+        .handle = htole32(handle),
+        .chunk_index = htole32(chunk_index),
+        .data_size = htole32(size),
+        .crc32 = htole32(crc32_ieee(data, size)),
+    };
+    return send_packet_parts(device, GFXLINK_OP_RESOURCE_WRITE,
+                             GFXLINK_FLAG_NO_RESPONSE,
+                             &request_header, sizeof(request_header),
+                             data, size, NULL);
 }
 
 int grape_resource_write(grape_device_t *device,
@@ -519,37 +624,50 @@ int grape_resource_write(grape_device_t *device,
                          const void *data,
                          uint32_t size)
 {
-    const uint32_t header_size = sizeof(gfxlink_resource_write_request_t);
-    if (!data || size == 0U || size > GFXLINK_MAX_PAYLOAD - header_size) {
+    if (offset % GFXLINK_RESOURCE_CHUNK_SIZE != 0U) {
+        return GRAPE_ERROR_INVALID_ARGUMENT;
+    }
+    return resource_write_chunk(device, handle,
+                                offset / GFXLINK_RESOURCE_CHUNK_SIZE,
+                                data, size);
+}
+
+int grape_resource_commit(grape_device_t *device,
+                          grape_handle_t handle,
+                          uint32_t expected_crc32,
+                          grape_resource_commit_report_t *out_report)
+{
+    if (!device || handle == 0U || !out_report) {
         return GRAPE_ERROR_INVALID_ARGUMENT;
     }
 
-    uint32_t payload_size = header_size + size;
-    uint8_t *payload = malloc(payload_size);
-    if (!payload) {
-        return GRAPE_ERROR_NO_MEMORY;
+    gfxlink_resource_commit_request_t request_payload = {
+        .handle = htole32(handle),
+        .expected_crc32 = htole32(expected_crc32),
+    };
+    gfxlink_resource_commit_response_t response;
+    uint32_t size = 0U;
+    int result = request(device, GFXLINK_OP_RESOURCE_COMMIT,
+                         &request_payload, sizeof(request_payload),
+                         &response, sizeof(response), &size);
+    if (result != GRAPE_OK) {
+        return result;
+    }
+    if (size != sizeof(response)) {
+        return GRAPE_ERROR_PROTOCOL;
     }
 
-    gfxlink_resource_write_request_t request_header = {
-        .handle = htole32(handle),
-        .offset = htole32(offset),
-    };
-    memcpy(payload, &request_header, sizeof(request_header));
-    memcpy(payload + sizeof(request_header), data, size);
-
-    int result = status_request(device, GFXLINK_OP_RESOURCE_WRITE,
-                                payload, payload_size);
-    free(payload);
-    return result;
-}
-
-int grape_resource_commit(grape_device_t *device, grape_handle_t handle)
-{
-    gfxlink_resource_handle_request_t request_payload = {
-        .handle = htole32(handle),
-    };
-    return status_request(device, GFXLINK_OP_RESOURCE_COMMIT,
-                          &request_payload, sizeof(request_payload));
+    memset(out_report, 0, sizeof(*out_report));
+    out_report->chunk_count = le32toh(response.chunk_count);
+    out_report->resource_crc32 = le32toh(response.resource_crc32);
+    memcpy(out_report->missing_bitmap, response.missing_bitmap,
+           sizeof(out_report->missing_bitmap));
+    memcpy(out_report->corrupt_bitmap, response.corrupt_bitmap,
+           sizeof(out_report->corrupt_bitmap));
+    if (out_report->chunk_count > GFXLINK_RESOURCE_MAX_CHUNKS) {
+        return GRAPE_ERROR_PROTOCOL;
+    }
+    return response_status(&response, size);
 }
 
 int grape_resource_destroy(grape_device_t *device, grape_handle_t handle)
@@ -561,44 +679,168 @@ int grape_resource_destroy(grape_device_t *device, grape_handle_t handle)
                           &request_payload, sizeof(request_payload));
 }
 
-int grape_resource_upload(grape_device_t *device,
-                           gfxlink_resource_kind_t kind,
-                           const void *data,
-                           uint32_t size,
-                           grape_handle_t *out_handle)
+static uint32_t chunk_size_for_upload(uint32_t total_size, uint32_t chunk_index)
 {
-    if (!device || !data || !out_handle || size == 0U) {
+    uint32_t offset = chunk_index * GFXLINK_RESOURCE_CHUNK_SIZE;
+    uint32_t remaining = total_size - offset;
+    return remaining < GFXLINK_RESOURCE_CHUNK_SIZE ? remaining : GFXLINK_RESOURCE_CHUNK_SIZE;
+}
+
+static int resend_reported_chunks(grape_device_t *device,
+                                  grape_handle_t handle,
+                                  const uint8_t *data,
+                                  uint32_t total_size,
+                                  const grape_resource_commit_report_t *report,
+                                  grape_resource_upload_stats_t *stats)
+{
+    bool resent = false;
+    for (uint32_t i = 0U; i < report->chunk_count; ++i) {
+        if (!bitmap_test(report->missing_bitmap, i) &&
+            !bitmap_test(report->corrupt_bitmap, i)) {
+            continue;
+        }
+
+        uint32_t size = chunk_size_for_upload(total_size, i);
+        uint32_t offset = i * GFXLINK_RESOURCE_CHUNK_SIZE;
+        int result = resource_write_chunk(device, handle, i, data + offset, size);
+        if (result != GRAPE_OK) {
+            return result;
+        }
+        resent = true;
+        if (stats) {
+            stats->chunks_sent++;
+            stats->chunks_retransmitted++;
+        }
+    }
+    return resent ? GRAPE_OK : GRAPE_ERROR_PROTOCOL;
+}
+
+static int resend_all_chunks(grape_device_t *device,
+                             grape_handle_t handle,
+                             const uint8_t *data,
+                             uint32_t total_size,
+                             uint32_t chunk_count,
+                             grape_resource_upload_stats_t *stats)
+{
+    for (uint32_t i = 0U; i < chunk_count; ++i) {
+        uint32_t size = chunk_size_for_upload(total_size, i);
+        uint32_t offset = i * GFXLINK_RESOURCE_CHUNK_SIZE;
+        int result = resource_write_chunk(device, handle, i, data + offset, size);
+        if (result != GRAPE_OK) {
+            return result;
+        }
+        if (stats) {
+            stats->chunks_sent++;
+            stats->chunks_retransmitted++;
+        }
+    }
+    return GRAPE_OK;
+}
+
+int grape_resource_upload_ex(grape_device_t *device,
+                             gfxlink_resource_kind_t kind,
+                             const void *data,
+                             uint32_t size,
+                             grape_handle_t *out_handle,
+                             grape_resource_upload_stats_t *out_stats)
+{
+    if (!device || !data || !out_handle || size == 0U ||
+        size > GFXLINK_MAX_RESOURCE_SIZE) {
         return GRAPE_ERROR_INVALID_ARGUMENT;
     }
 
-    grape_handle_t handle = 0U;
-    int result = grape_resource_create(device, kind, size, &handle);
+    grape_resource_upload_stats_t stats = {0};
+    grape_resource_info_t info;
+    int result = grape_resource_create(device, kind, size, &info);
     if (result != GRAPE_OK) {
         return result;
+    }
+
+    uint32_t expected_chunks =
+        (size + GFXLINK_RESOURCE_CHUNK_SIZE - 1U) / GFXLINK_RESOURCE_CHUNK_SIZE;
+    if (info.chunk_count != expected_chunks) {
+        grape_resource_destroy(device, info.handle);
+        return GRAPE_ERROR_PROTOCOL;
     }
 
     const uint8_t *bytes = data;
-    const uint32_t max_chunk =
-        GFXLINK_MAX_PAYLOAD - sizeof(gfxlink_resource_write_request_t);
-
-    uint32_t offset = 0U;
-    while (offset < size) {
-        uint32_t remaining = size - offset;
-        uint32_t chunk = remaining < max_chunk ? remaining : max_chunk;
-        result = grape_resource_write(device, handle, offset, bytes + offset, chunk);
+    uint32_t expected_crc32 = crc32_ieee(bytes, size);
+    for (uint32_t i = 0U; i < info.chunk_count; ++i) {
+        uint32_t chunk_size = chunk_size_for_upload(size, i);
+        uint32_t offset = i * GFXLINK_RESOURCE_CHUNK_SIZE;
+        result = resource_write_chunk(device, info.handle, i,
+                                      bytes + offset, chunk_size);
         if (result != GRAPE_OK) {
-            grape_resource_destroy(device, handle);
+            grape_resource_destroy(device, info.handle);
             return result;
         }
-        offset += chunk;
+        stats.chunks_sent++;
     }
 
-    result = grape_resource_commit(device, handle);
-    if (result != GRAPE_OK) {
-        grape_resource_destroy(device, handle);
-        return result;
+    for (uint32_t attempt = 0U;
+         attempt < GFXLINK_RESOURCE_MAX_COMMIT_ATTEMPTS;
+         ++attempt) {
+        grape_resource_commit_report_t report;
+        result = grape_resource_commit(device, info.handle,
+                                       expected_crc32, &report);
+        stats.commit_attempts++;
+
+        if (result == GRAPE_OK) {
+            if (report.chunk_count != info.chunk_count ||
+                report.resource_crc32 != expected_crc32) {
+                result = GRAPE_ERROR_PROTOCOL;
+                break;
+            }
+            *out_handle = info.handle;
+            if (out_stats) {
+                *out_stats = stats;
+            }
+            return GRAPE_OK;
+        }
+
+        if (report.chunk_count != info.chunk_count) {
+            result = GRAPE_ERROR_PROTOCOL;
+            break;
+        }
+
+        if (result == GRAPE_ERROR_REMOTE_BASE + GFXLINK_STATUS_INCOMPLETE) {
+            result = resend_reported_chunks(device, info.handle, bytes, size,
+                                            &report, &stats);
+            if (result != GRAPE_OK) {
+                break;
+            }
+            continue;
+        }
+
+        if (result == GRAPE_ERROR_REMOTE_BASE + GFXLINK_STATUS_CHECKSUM_MISMATCH) {
+            result = resend_all_chunks(device, info.handle, bytes, size,
+                                       info.chunk_count, &stats);
+            if (result != GRAPE_OK) {
+                break;
+            }
+            continue;
+        }
+
+        break;
     }
 
-    *out_handle = handle;
-    return GRAPE_OK;
+    grape_resource_destroy(device, info.handle);
+    if (out_stats) {
+        *out_stats = stats;
+    }
+    if (result == GRAPE_OK ||
+        result == GRAPE_ERROR_REMOTE_BASE + GFXLINK_STATUS_INCOMPLETE ||
+        result == GRAPE_ERROR_REMOTE_BASE + GFXLINK_STATUS_CHECKSUM_MISMATCH) {
+        return GRAPE_ERROR_RETRY_LIMIT;
+    }
+    return result;
+}
+
+int grape_resource_upload(grape_device_t *device,
+                          gfxlink_resource_kind_t kind,
+                          const void *data,
+                          uint32_t size,
+                          grape_handle_t *out_handle)
+{
+    return grape_resource_upload_ex(device, kind, data, size, out_handle, NULL);
 }

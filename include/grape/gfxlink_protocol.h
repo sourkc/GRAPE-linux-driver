@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 #define GFXLINK_MAGIC 0x50415247u
-#define GFXLINK_PROTOCOL_VERSION 2u
+#define GFXLINK_PROTOCOL_VERSION 3u
 #define GFXLINK_MAX_PAYLOAD (16u * 1024u)
 #define GFXLINK_MAX_RESOURCE_SIZE (16u * 1024u * 1024u)
 
@@ -14,6 +14,7 @@
 #define GFXLINK_USB_EP_IN 0x81u
 
 #define GFXLINK_FLAG_RESPONSE 0x0001u
+#define GFXLINK_FLAG_NO_RESPONSE 0x0002u
 
 #define GFXLINK_CAP_SOLID_SURFACE (1u << 0)
 #define GFXLINK_CAP_SURFACE_POSITION (1u << 1)
@@ -21,6 +22,13 @@
 #define GFXLINK_CAP_SURFACE_DESTROY (1u << 3)
 #define GFXLINK_CAP_EXPLICIT_PRESENT (1u << 4)
 #define GFXLINK_CAP_RESOURCE_STREAM (1u << 5)
+#define GFXLINK_CAP_RELIABLE_RESOURCE_STREAM (1u << 6)
+
+#define GFXLINK_RESOURCE_WRITE_HEADER_SIZE 16u
+#define GFXLINK_RESOURCE_CHUNK_SIZE (GFXLINK_MAX_PAYLOAD - GFXLINK_RESOURCE_WRITE_HEADER_SIZE)
+#define GFXLINK_RESOURCE_MAX_CHUNKS \
+    ((GFXLINK_MAX_RESOURCE_SIZE + GFXLINK_RESOURCE_CHUNK_SIZE - 1u) / GFXLINK_RESOURCE_CHUNK_SIZE)
+#define GFXLINK_RESOURCE_BITMAP_BYTES ((GFXLINK_RESOURCE_MAX_CHUNKS + 7u) / 8u)
 
 typedef enum {
     GFXLINK_OP_HELLO = 0x01,
@@ -48,6 +56,7 @@ typedef enum {
     GFXLINK_STATUS_BUSY = -6,
     GFXLINK_STATUS_INTERNAL = -7,
     GFXLINK_STATUS_INCOMPLETE = -8,
+    GFXLINK_STATUS_CHECKSUM_MISMATCH = -9,
 } gfxlink_status_t;
 
 typedef enum {
@@ -128,12 +137,29 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     int32_t status;
     uint32_t handle;
+    uint32_t chunk_size;
+    uint32_t chunk_count;
 } gfxlink_resource_create_response_t;
 
 typedef struct __attribute__((packed)) {
     uint32_t handle;
-    uint32_t offset;
+    uint32_t chunk_index;
+    uint32_t data_size;
+    uint32_t crc32;
 } gfxlink_resource_write_request_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t handle;
+    uint32_t expected_crc32;
+} gfxlink_resource_commit_request_t;
+
+typedef struct __attribute__((packed)) {
+    int32_t status;
+    uint32_t chunk_count;
+    uint32_t resource_crc32;
+    uint8_t missing_bitmap[GFXLINK_RESOURCE_BITMAP_BYTES];
+    uint8_t corrupt_bitmap[GFXLINK_RESOURCE_BITMAP_BYTES];
+} gfxlink_resource_commit_response_t;
 
 typedef struct __attribute__((packed)) {
     uint32_t handle;
@@ -144,5 +170,6 @@ typedef struct __attribute__((packed)) {
 } gfxlink_status_response_t;
 
 _Static_assert(sizeof(gfxlink_header_t) == 16, "GFXLINK header must be 16 bytes");
-_Static_assert(sizeof(gfxlink_resource_write_request_t) == 8,
-               "GFXLINK resource write header must be 8 bytes");
+_Static_assert(sizeof(gfxlink_resource_write_request_t) == GFXLINK_RESOURCE_WRITE_HEADER_SIZE,
+               "GFXLINK resource write header must match protocol constant");
+_Static_assert(GFXLINK_RESOURCE_CHUNK_SIZE > 0u, "GFXLINK resource chunk size must be positive");

@@ -261,12 +261,14 @@ static int command_upload_test(grape_device_t *device, int argc, char **argv)
     clock_gettime(CLOCK_MONOTONIC, &start);
 
     grape_handle_t handle = 0U;
-    int result = grape_resource_upload(
+    grape_resource_upload_stats_t stats;
+    int result = grape_resource_upload_ex(
         device,
         GFXLINK_RESOURCE_GENERIC,
         data,
         size,
-        &handle
+        &handle,
+        &stats
     );
 
     clock_gettime(CLOCK_MONOTONIC, &end);
@@ -282,8 +284,14 @@ static int command_upload_test(grape_device_t *device, int argc, char **argv)
 
     printf("resource=%" PRIu32
            " uploaded=%" PRIu32
-           " bytes time=%.3f s throughput=%.2f MiB/s\n",
-           handle, size, seconds, throughput);
+           " bytes time=%.3f s throughput=%.2f MiB/s"
+           " chunks=%" PRIu32
+           " retransmits=%" PRIu32
+           " commits=%" PRIu32 "\n",
+           handle, size, seconds, throughput,
+           stats.chunks_sent,
+           stats.chunks_retransmitted,
+           stats.commit_attempts);
 
     result = grape_resource_destroy(device, handle);
     if (result != GRAPE_OK) {
