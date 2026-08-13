@@ -833,7 +833,7 @@ int grape_resource_create(grape_device_t *device,
                           grape_resource_info_t *out_info)
 {
     if (!device || !out_info ||
-        kind > GFXLINK_RESOURCE_SVG ||
+        kind > GFXLINK_RESOURCE_TEXT ||
         total_size == 0U || total_size > GFXLINK_MAX_RESOURCE_SIZE) {
         return GRAPE_ERROR_INVALID_ARGUMENT;
     }
