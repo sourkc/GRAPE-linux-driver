@@ -58,6 +58,9 @@ typedef struct {
     uint32_t max_surfaces;
     uint32_t max_resources;
     uint32_t max_textures;
+    uint32_t max_paths;
+    uint32_t max_svg_documents;
+    uint32_t max_fonts;
 } grape_device_info_t;
 
 typedef struct {
@@ -87,6 +90,82 @@ typedef struct {
     uint32_t stride;
     uint32_t size;
 } grape_texture_info_t;
+
+typedef enum {
+    GRAPE_PATH_MOVE_TO = GFXLINK_PATH_MOVE_TO,
+    GRAPE_PATH_LINE_TO = GFXLINK_PATH_LINE_TO,
+    GRAPE_PATH_QUAD_TO = GFXLINK_PATH_QUAD_TO,
+    GRAPE_PATH_CUBIC_TO = GFXLINK_PATH_CUBIC_TO,
+    GRAPE_PATH_ARC_TO = GFXLINK_PATH_ARC_TO,
+    GRAPE_PATH_CLOSE = GFXLINK_PATH_CLOSE,
+} grape_path_command_type_t;
+
+typedef struct {
+    grape_path_command_type_t type;
+    bool large_arc;
+    bool sweep;
+    /*
+     * MOVE/LINE: x,y
+     * QUAD: cx,cy,x,y
+     * CUBIC: c1x,c1y,c2x,c2y,x,y
+     * ARC: rx,ry,x_axis_rotation_degrees,x,y (flags use large_arc/sweep)
+     * CLOSE: no values
+     */
+    float values[GFXLINK_PATH_COMMAND_VALUE_COUNT];
+} grape_path_command_t;
+
+typedef struct {
+    grape_handle_t texture_handle;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    float origin_x;
+    float origin_y;
+    float pixels_per_unit;
+} grape_path_raster_info_t;
+
+typedef struct {
+    float x;
+    float y;
+    float width;
+    float height;
+    uint8_t samples_per_axis;
+    uint32_t padding_pixels;
+    int32_t z_base;
+} grape_svg_config_t;
+
+#define GRAPE_SVG_CONFIG_DEFAULT()     { 0.0f, 0.0f, 0.0f, 0.0f, 4U, 1U, 0 }
+
+typedef struct {
+    grape_handle_t handle;
+    uint32_t layer_count;
+    float view_box_min_x;
+    float view_box_min_y;
+    float view_box_width;
+    float view_box_height;
+} grape_svg_info_t;
+
+typedef struct {
+    grape_handle_t handle;
+    uint32_t units_per_em;
+    uint32_t glyph_count;
+    uint32_t cmap_format;
+    int32_t ascender;
+    int32_t descender;
+    int32_t line_gap;
+} grape_font_info_t;
+
+typedef struct {
+    grape_handle_t texture_handle;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    float origin_x;
+    float origin_y;
+    float pixels_per_unit;
+    float advance_width;
+    uint32_t glyph_count;
+} grape_text_raster_info_t;
 
 int grape_open(grape_device_t **out_device);
 void grape_close(grape_device_t *device);
@@ -131,6 +210,39 @@ int grape_texture_update(grape_device_t *device,
                          const void *pixels,
                          uint32_t size);
 int grape_texture_destroy(grape_device_t *device, grape_handle_t texture);
+
+/* M2.2 vector paths and SVG. Path commands are uploaded as one packed resource. */
+int grape_path_create(grape_device_t *device,
+                      const grape_path_command_t *commands,
+                      uint32_t command_count,
+                      grape_handle_t *out_path);
+int grape_path_rasterize(grape_device_t *device,
+                         grape_handle_t path,
+                         float pixels_per_unit,
+                         uint8_t samples_per_axis,
+                         uint32_t padding_pixels,
+                         grape_path_raster_info_t *out_raster);
+int grape_path_destroy(grape_device_t *device, grape_handle_t path);
+int grape_svg_create(grape_device_t *device,
+                     const char *svg_text,
+                     uint32_t svg_size,
+                     const grape_svg_config_t *config,
+                     grape_svg_info_t *out_svg);
+int grape_svg_destroy(grape_device_t *device, grape_handle_t svg);
+
+/* M2.3 fonts and UTF-8 text. Fonts own their uploaded backing bytes remotely. */
+int grape_font_create(grape_device_t *device,
+                      const void *ttf_data,
+                      uint32_t ttf_size,
+                      grape_font_info_t *out_font);
+int grape_font_destroy(grape_device_t *device, grape_handle_t font);
+int grape_text_rasterize_utf8(grape_device_t *device,
+                              grape_handle_t font,
+                              const char *utf8,
+                              float pixels_per_unit,
+                              uint8_t samples_per_axis,
+                              uint32_t padding_pixels,
+                              grape_text_raster_info_t *out_raster);
 
 /* M2.1 persistent surface API. */
 int grape_surface_create(grape_device_t *device,
