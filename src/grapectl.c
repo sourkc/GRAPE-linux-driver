@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <libusb-1.0/libusb.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,53 @@
 #define GFXLINK_TIMEOUT_MS 1500
 
 static uint32_t s_sequence = 1;
+
+static int open_grape_device(libusb_context *usb, libusb_device_handle **out_device)
+{
+    if (!usb || !out_device) {
+        return LIBUSB_ERROR_INVALID_PARAM;
+    }
+
+    *out_device = NULL;
+
+    libusb_device **devices = NULL;
+    ssize_t count = libusb_get_device_list(usb, &devices);
+    if (count < 0) {
+        return (int)count;
+    }
+
+    int open_error = LIBUSB_ERROR_NOT_FOUND;
+    bool found = false;
+
+    for (ssize_t i = 0; i < count; i++) {
+        struct libusb_device_descriptor descriptor;
+        int ret = libusb_get_device_descriptor(devices[i], &descriptor);
+        if (ret != 0) {
+            continue;
+        }
+
+        if (descriptor.idVendor != GFXLINK_USB_VID ||
+            descriptor.idProduct != GFXLINK_USB_PID) {
+            continue;
+        }
+
+        found = true;
+        ret = libusb_open(devices[i], out_device);
+        if (ret == 0) {
+            open_error = 0;
+            break;
+        }
+
+        open_error = ret;
+    }
+
+    libusb_free_device_list(devices, 1);
+
+    if (!found) {
+        return LIBUSB_ERROR_NOT_FOUND;
+    }
+    return open_error;
+}
 
 static uint32_t float_bits(float value)
 {
@@ -432,14 +480,22 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    libusb_device_handle *device = libusb_open_device_with_vid_pid(
-        usb,
-        GFXLINK_USB_VID,
-        GFXLINK_USB_PID
-    );
-    if (!device) {
-        fprintf(stderr, "GRAPE %04x:%04x not found\n",
-                GFXLINK_USB_VID, GFXLINK_USB_PID);
+    libusb_device_handle *device = NULL;
+    ret = open_grape_device(usb, &device);
+    if (ret != 0) {
+        if (ret == LIBUSB_ERROR_NOT_FOUND) {
+            fprintf(stderr, "GRAPE %04x:%04x not found\n",
+                    GFXLINK_USB_VID, GFXLINK_USB_PID);
+        } else if (ret == LIBUSB_ERROR_ACCESS) {
+            fprintf(stderr,
+                    "GRAPE %04x:%04x found, but access was denied. "
+                    "Install the udev rule or run as root.\n",
+                    GFXLINK_USB_VID, GFXLINK_USB_PID);
+        } else {
+            fprintf(stderr, "Unable to open GRAPE %04x:%04x: %s\n",
+                    GFXLINK_USB_VID, GFXLINK_USB_PID,
+                    libusb_error_name(ret));
+        }
         libusb_exit(usb);
         return 1;
     }
