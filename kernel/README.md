@@ -2,7 +2,7 @@
 
 `grape_drm` is the kernel-side GFXLINK driver.
 
-M3.1 adds dumb/shmem GEM scanout on top of the M3.0 USB + KMS skeleton. Linux
+M3.1b adds dumb/shmem GEM scanout on top of the M3.0 USB + KMS skeleton. Linux
 can now allocate an RGB565 or XRGB8888 framebuffer, modeset it through normal
 DRM/KMS, and have the driver convert/upload it into one persistent full-screen
 GRAPE RGB565 texture and surface.
@@ -14,6 +14,10 @@ path. The driver keeps a one-frame mailbox: if Linux submits more frames while
 one is uploading, only the newest pending frame is retained.
 
 Damage-rectangle scanout belongs to M3.2.
+
+M3.1b also attaches the required `drm_crtc_helper_funcs` table to the GRAPE
+CRTC. Without it, Linux 7.1's atomic modeset helper dereferences a NULL CRTC
+helper pointer during the first KWin modeset, before scanout can run.
 
 ## Build
 

@@ -13,6 +13,7 @@
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
+#include <drm/drm_crtc_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_encoder.h>
 #include <drm/drm_file.h>
@@ -963,6 +964,10 @@ static const struct drm_crtc_funcs grape_crtc_funcs = {
     .atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
 };
 
+static const struct drm_crtc_helper_funcs grape_crtc_helper_funcs = {
+    .atomic_check = drm_crtc_helper_atomic_check,
+};
+
 static const struct drm_plane_helper_funcs grape_plane_helper_funcs = {
     DRM_GEM_SHADOW_PLANE_HELPER_FUNCS,
     .atomic_update = grape_plane_atomic_update,
@@ -1024,6 +1029,7 @@ static int grape_modeset_init(struct grape_drm_device *gdev)
                                     &grape_crtc_funcs, NULL);
     if (ret)
         return ret;
+    drm_crtc_helper_add(&gdev->crtc, &grape_crtc_helper_funcs);
 
     ret = drm_encoder_init(drm, &gdev->encoder, &grape_encoder_funcs,
                            DRM_MODE_ENCODER_NONE, NULL);
@@ -1070,6 +1076,7 @@ static const struct drm_driver grape_drm_driver = {
     .desc = GRAPE_DRM_DESC,
     .major = 0,
     .minor = 4,
+    .patchlevel = 1,
 };
 
 static int grape_usb_probe(struct usb_interface *interface,
