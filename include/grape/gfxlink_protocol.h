@@ -1,6 +1,14 @@
 #pragma once
 
+#ifdef __KERNEL__
+#include <linux/types.h>
+typedef u8 uint8_t;
+typedef u16 uint16_t;
+typedef u32 uint32_t;
+typedef s32 int32_t;
+#else
 #include <stdint.h>
+#endif
 
 #define GFXLINK_MAGIC 0x50415247u
 #define GFXLINK_PROTOCOL_VERSION 5u
