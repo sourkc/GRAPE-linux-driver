@@ -2,22 +2,28 @@
 
 `grape_drm` is the kernel-side GFXLINK driver.
 
-M3.1b adds dumb/shmem GEM scanout on top of the M3.0 USB + KMS skeleton. Linux
-can now allocate an RGB565 or XRGB8888 framebuffer, modeset it through normal
-DRM/KMS, and have the driver convert/upload it into one persistent full-screen
-GRAPE RGB565 texture and surface.
+M3.2 adds damage-aware asynchronous scanout. Linux still exposes the same fixed
+720x1280 DRM/KMS display with RGB565 and XRGB8888 dumb/shmem framebuffers, but
+plane updates now consume DRM `FB_DAMAGE_CLIPS` and upload only changed regions
+to the persistent GRAPE RGB565 texture.
 
-This is deliberately still unaccelerated scanout. Each plane update currently
-uploads the full 720x1280 frame through the existing reliable GFXLINK resource
-stream. The USB upload runs on a workqueue, never inside the DRM atomic commit
-path. The driver keeps a one-frame mailbox: if Linux submits more frames while
-one is uploading, only the newest pending frame is retained.
+The atomic commit path never performs USB I/O. Changed pixels are converted into
+a two-buffer mailbox and a worker sends the latest pending damage over GFXLINK.
+If more commits arrive while an upload is active, their damage is accumulated
+and the mailbox keeps the newest pixels for those regions instead of queueing
+stale frames.
 
-Damage-rectangle scanout belongs to M3.2.
+Up to eight exact damaged rectangles are retained. If damage becomes more
+fragmented than that, or covers at least 70% of the display, the driver converts
+and queues a fresh full frame. This keeps the partial-update shadow state correct
+while avoiding excessive per-rectangle GFXLINK resource transactions.
 
-M3.1b also attaches the required `drm_crtc_helper_funcs` table to the GRAPE
-CRTC. Without it, Linux 7.1's atomic modeset helper dereferences a NULL CRTC
-helper pointer during the first KWin modeset, before scanout can run.
+M3.2 also validates the primary plane as fixed 1:1 fullscreen scanout. GRAPE does
+not currently implement scaling, cropping, or plane positioning.
+
+The first frame after connect is always a full-frame update so the remote texture
+starts from a known state. A failed damage upload also forces the next update to
+refresh the full screen.
 
 ## Build
 
@@ -33,38 +39,31 @@ kernel was built with Clang (as CachyOS commonly is), it automatically passes
 `LLVM=1` to Kbuild so the external module uses the matching compiler family.
 You can override this with `KBUILD_TOOLCHAIN=...` if necessary.
 
-## First scanout test
+## Test
 
 Load the module:
 
 ```sh
 sudo insmod kernel/grape_drm.ko
-sudo dmesg | tail -n 40
+sudo dmesg | tail -n 50
 modetest -M grape -c
-```
-
-Then inspect the IDs:
-
-```sh
 modetest -M grape -p
 ```
 
-For the common M3.1 layout (one connector, one CRTC, one primary plane), use
-`modetest` to set the preferred 720x1280 mode and a test framebuffer. The exact
-connector/CRTC IDs are printed by `modetest -M grape -c` and `-p` and can vary
-between boots, so do not hard-code the numeric IDs in scripts yet.
+KWin/Plasma can use the display normally. Small updates such as cursor movement,
+hover changes, terminal output, and localized window damage should now transfer
+far less than the ~1.76 MiB full RGB565 frame.
 
-A typical command is:
+For an explicit modeset test, use the connector and CRTC IDs reported by
+`modetest`:
 
 ```sh
 modetest -M grape -s <connector_id>@<crtc_id>:720x1280-60
 ```
 
-`modetest` should allocate a dumb framebuffer and put its default test pattern
-on the physical GRAPE panel. The first frame can take hundreds of milliseconds
-because M3.1 intentionally uses the existing ~5 MiB/s full-frame upload path,
-but that transfer happens asynchronously and must not stall the compositor or
-the VM's other displays.
+On disconnect the driver logs scanout counters including submitted/uploaded
+frames, dropped mailbox frames, uploaded rectangles, uploaded pixel bytes, and
+how often fragmented/large damage collapsed to a full refresh.
 
 Unload the module to return the USB interface to `libusb`/`grapectl`:
 
