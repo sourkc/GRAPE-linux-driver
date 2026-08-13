@@ -3,6 +3,8 @@ AR ?= ar
 CFLAGS ?= -O2 -Wall -Wextra -Wpedantic
 CPPFLAGS += -Iinclude $(shell pkg-config --cflags libusb-1.0)
 LDLIBS += $(shell pkg-config --libs libusb-1.0)
+GRAPECTL_CPPFLAGS := $(shell pkg-config --cflags libpng)
+GRAPECTL_LDLIBS := $(shell pkg-config --libs libpng)
 
 BUILD_DIR ?= build
 UDEV_RULES_DIR ?= /etc/udev/rules.d
@@ -24,7 +26,7 @@ $(LIBGRAPE): $(LIBGRAPE_OBJ)
 	$(AR) rcs $@ $^
 
 grapectl: src/grapectl.c $(LIBGRAPE) include/grape/grape.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) -std=gnu11 -o $@ src/grapectl.c $(LIBGRAPE) $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(GRAPECTL_CPPFLAGS) $(CFLAGS) -std=gnu11 -o $@ src/grapectl.c $(LIBGRAPE) $(LDLIBS) $(GRAPECTL_LDLIBS)
 
 clean:
 	rm -rf $(BUILD_DIR) $(LIBGRAPE) grapectl

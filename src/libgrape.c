@@ -25,6 +25,16 @@ static uint32_t float_bits(float value)
     return htole32(bits);
 }
 
+static size_t pixel_bytes(grape_pixel_format_t format)
+{
+    switch (format) {
+        case GRAPE_PIXEL_FORMAT_RGB565: return 2U;
+        case GRAPE_PIXEL_FORMAT_RGB888: return 3U;
+        case GRAPE_PIXEL_FORMAT_A8: return 1U;
+        default: return 0U;
+    }
+}
+
 static uint32_t s_crc32_table[256];
 static bool s_crc32_table_ready;
 
@@ -452,6 +462,7 @@ int grape_get_info(grape_device_t *device, grape_device_info_t *out_info)
     out_info->pixel_format = le32toh(response.pixel_format);
     out_info->max_surfaces = le32toh(response.max_surfaces);
     out_info->max_resources = le32toh(response.max_resources);
+    out_info->max_textures = le32toh(response.max_textures);
     return GRAPE_OK;
 }
 
@@ -545,6 +556,263 @@ int grape_surface_destroy(grape_device_t *device, grape_handle_t handle)
         .handle = htole32(handle),
     };
     return status_request(device, GFXLINK_OP_DESTROY_SURFACE,
+                          &request_payload, sizeof(request_payload));
+}
+
+int grape_surface_create(grape_device_t *device,
+                         grape_handle_t texture,
+                         grape_handle_t *out_surface)
+{
+    if (!device || texture == 0U || !out_surface) {
+        return GRAPE_ERROR_INVALID_ARGUMENT;
+    }
+    gfxlink_create_surface_request_t request_payload = {
+        .texture_handle = htole32(texture),
+    };
+    gfxlink_create_surface_response_t response;
+    uint32_t size = 0U;
+    int result = request(device, GFXLINK_OP_CREATE_SURFACE,
+                         &request_payload, sizeof(request_payload),
+                         &response, sizeof(response), &size);
+    if (result != GRAPE_OK) return result;
+    if (size != sizeof(response)) return GRAPE_ERROR_PROTOCOL;
+    result = response_status(&response, size);
+    if (result != GRAPE_OK) return result;
+    *out_surface = le32toh(response.handle);
+    return *out_surface != 0U ? GRAPE_OK : GRAPE_ERROR_PROTOCOL;
+}
+
+int grape_surface_set_texture(grape_device_t *device,
+                              grape_handle_t surface,
+                              grape_handle_t texture)
+{
+    gfxlink_set_surface_texture_request_t request_payload = {
+        .handle = htole32(surface),
+        .texture_handle = htole32(texture),
+    };
+    return status_request(device, GFXLINK_OP_SET_SURFACE_TEXTURE,
+                          &request_payload, sizeof(request_payload));
+}
+
+int grape_surface_set_transform(grape_device_t *device,
+                                grape_handle_t surface,
+                                const grape_transform_t *transform)
+{
+    if (!device || surface == 0U || !transform) return GRAPE_ERROR_INVALID_ARGUMENT;
+    gfxlink_set_surface_transform_request_t request_payload = {
+        .handle = htole32(surface),
+        .x_bits = float_bits(transform->x),
+        .y_bits = float_bits(transform->y),
+        .scale_x_bits = float_bits(transform->scale_x),
+        .scale_y_bits = float_bits(transform->scale_y),
+        .rotation_bits = float_bits(transform->rotation),
+        .origin_x_bits = float_bits(transform->origin_x),
+        .origin_y_bits = float_bits(transform->origin_y),
+    };
+    return status_request(device, GFXLINK_OP_SET_SURFACE_TRANSFORM,
+                          &request_payload, sizeof(request_payload));
+}
+
+int grape_surface_set_scale(grape_device_t *device,
+                            grape_handle_t surface,
+                            float scale_x,
+                            float scale_y)
+{
+    gfxlink_set_surface_scale_request_t request_payload = {
+        .handle = htole32(surface),
+        .scale_x_bits = float_bits(scale_x),
+        .scale_y_bits = float_bits(scale_y),
+    };
+    return status_request(device, GFXLINK_OP_SET_SURFACE_SCALE,
+                          &request_payload, sizeof(request_payload));
+}
+
+int grape_surface_set_rotation(grape_device_t *device,
+                               grape_handle_t surface,
+                               float radians)
+{
+    gfxlink_set_surface_rotation_request_t request_payload = {
+        .handle = htole32(surface),
+        .rotation_bits = float_bits(radians),
+    };
+    return status_request(device, GFXLINK_OP_SET_SURFACE_ROTATION,
+                          &request_payload, sizeof(request_payload));
+}
+
+int grape_surface_set_origin(grape_device_t *device,
+                             grape_handle_t surface,
+                             float origin_x,
+                             float origin_y)
+{
+    gfxlink_set_surface_origin_request_t request_payload = {
+        .handle = htole32(surface),
+        .origin_x_bits = float_bits(origin_x),
+        .origin_y_bits = float_bits(origin_y),
+    };
+    return status_request(device, GFXLINK_OP_SET_SURFACE_ORIGIN,
+                          &request_payload, sizeof(request_payload));
+}
+
+int grape_surface_set_z(grape_device_t *device,
+                        grape_handle_t surface,
+                        int32_t z)
+{
+    gfxlink_set_surface_z_request_t request_payload = {
+        .handle = htole32(surface),
+        .z = (int32_t)htole32((uint32_t)z),
+    };
+    return status_request(device, GFXLINK_OP_SET_SURFACE_Z,
+                          &request_payload, sizeof(request_payload));
+}
+
+int grape_surface_set_opacity(grape_device_t *device,
+                              grape_handle_t surface,
+                              uint8_t opacity)
+{
+    gfxlink_set_surface_opacity_request_t request_payload = {
+        .handle = htole32(surface),
+        .opacity = opacity,
+        .reserved = {0, 0, 0},
+    };
+    return status_request(device, GFXLINK_OP_SET_SURFACE_OPACITY,
+                          &request_payload, sizeof(request_payload));
+}
+
+int grape_surface_set_visible(grape_device_t *device,
+                              grape_handle_t surface,
+                              bool visible)
+{
+    gfxlink_set_surface_visible_request_t request_payload = {
+        .handle = htole32(surface),
+        .visible = visible ? 1U : 0U,
+        .reserved = {0, 0, 0},
+    };
+    return status_request(device, GFXLINK_OP_SET_SURFACE_VISIBLE,
+                          &request_payload, sizeof(request_payload));
+}
+
+static int upload_texture_resource(grape_device_t *device,
+                                   const void *pixels,
+                                   uint32_t size,
+                                   grape_handle_t *out_resource)
+{
+    if (!pixels || size == 0U || !out_resource) return GRAPE_ERROR_INVALID_ARGUMENT;
+    return grape_resource_upload(device, GFXLINK_RESOURCE_TEXTURE,
+                                 pixels, size, out_resource);
+}
+
+int grape_texture_create(grape_device_t *device,
+                         uint32_t width,
+                         uint32_t height,
+                         grape_pixel_format_t format,
+                         const void *pixels,
+                         uint32_t size,
+                         grape_texture_info_t *out_texture)
+{
+    if (!device || !out_texture || width == 0U || height == 0U) {
+        return GRAPE_ERROR_INVALID_ARGUMENT;
+    }
+    size_t bpp = pixel_bytes(format);
+    if (bpp == 0U || width > SIZE_MAX / bpp) return GRAPE_ERROR_INVALID_ARGUMENT;
+    size_t expected = (size_t)width * bpp;
+    if (height > SIZE_MAX / expected) return GRAPE_ERROR_INVALID_ARGUMENT;
+    expected *= height;
+    if (expected > UINT32_MAX || (pixels && size != expected) || (!pixels && size != 0U)) {
+        return GRAPE_ERROR_INVALID_ARGUMENT;
+    }
+
+    grape_handle_t resource = 0U;
+    int result = GRAPE_OK;
+    if (pixels) {
+        result = upload_texture_resource(device, pixels, size, &resource);
+        if (result != GRAPE_OK) return result;
+    }
+
+    gfxlink_texture_create_request_t request_payload = {
+        .width = htole32(width),
+        .height = htole32(height),
+        .format = htole32((uint32_t)format),
+        .resource_handle = htole32(resource),
+    };
+    gfxlink_texture_create_response_t response;
+    uint32_t response_size = 0U;
+    result = request(device, GFXLINK_OP_TEXTURE_CREATE,
+                     &request_payload, sizeof(request_payload),
+                     &response, sizeof(response), &response_size);
+    if (result == GRAPE_OK) {
+        if (response_size != sizeof(response)) {
+            result = GRAPE_ERROR_PROTOCOL;
+        } else {
+            result = response_status(&response, response_size);
+        }
+    }
+
+    int cleanup = resource ? grape_resource_destroy(device, resource) : GRAPE_OK;
+    if (result != GRAPE_OK) return result;
+    if (cleanup != GRAPE_OK) return cleanup;
+
+    out_texture->handle = le32toh(response.handle);
+    out_texture->width = width;
+    out_texture->height = height;
+    out_texture->format = format;
+    out_texture->stride = le32toh(response.stride);
+    out_texture->size = le32toh(response.size);
+    if (out_texture->handle == 0U || out_texture->size != expected ||
+        out_texture->stride < width * bpp) {
+        return GRAPE_ERROR_PROTOCOL;
+    }
+    return GRAPE_OK;
+}
+
+int grape_texture_update_rect(grape_device_t *device,
+                              grape_handle_t texture,
+                              uint32_t x,
+                              uint32_t y,
+                              uint32_t width,
+                              uint32_t height,
+                              const void *pixels,
+                              uint32_t size)
+{
+    if (!device || texture == 0U || width == 0U || height == 0U ||
+        !pixels || size == 0U) {
+        return GRAPE_ERROR_INVALID_ARGUMENT;
+    }
+
+    grape_handle_t resource = 0U;
+    int result = upload_texture_resource(device, pixels, size, &resource);
+    if (result != GRAPE_OK) return result;
+
+    gfxlink_texture_update_request_t request_payload = {
+        .texture_handle = htole32(texture),
+        .resource_handle = htole32(resource),
+        .x = htole32(x),
+        .y = htole32(y),
+        .width = htole32(width),
+        .height = htole32(height),
+    };
+    result = status_request(device, GFXLINK_OP_TEXTURE_UPDATE,
+                            &request_payload, sizeof(request_payload));
+    int cleanup = grape_resource_destroy(device, resource);
+    return result != GRAPE_OK ? result : cleanup;
+}
+
+int grape_texture_update(grape_device_t *device,
+                         grape_handle_t texture,
+                         uint32_t width,
+                         uint32_t height,
+                         const void *pixels,
+                         uint32_t size)
+{
+    return grape_texture_update_rect(device, texture, 0U, 0U,
+                                     width, height, pixels, size);
+}
+
+int grape_texture_destroy(grape_device_t *device, grape_handle_t texture)
+{
+    gfxlink_texture_handle_request_t request_payload = {
+        .handle = htole32(texture),
+    };
+    return status_request(device, GFXLINK_OP_TEXTURE_DESTROY,
                           &request_payload, sizeof(request_payload));
 }
 
