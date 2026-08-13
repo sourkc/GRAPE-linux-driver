@@ -1,197 +1,12 @@
-#include <endian.h>
 #include <errno.h>
 #include <inttypes.h>
-#include <libusb-1.0/libusb.h>
-#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
-#include "gfxlink_protocol.h"
-
-#define GFXLINK_TIMEOUT_MS 1500
-
-static uint32_t s_sequence = 1;
-
-static int open_grape_device(libusb_context *usb, libusb_device_handle **out_device)
-{
-    if (!usb || !out_device) {
-        return LIBUSB_ERROR_INVALID_PARAM;
-    }
-
-    *out_device = NULL;
-
-    libusb_device **devices = NULL;
-    ssize_t count = libusb_get_device_list(usb, &devices);
-    if (count < 0) {
-        return (int)count;
-    }
-
-    int open_error = LIBUSB_ERROR_NOT_FOUND;
-    bool found = false;
-
-    for (ssize_t i = 0; i < count; i++) {
-        struct libusb_device_descriptor descriptor;
-        int ret = libusb_get_device_descriptor(devices[i], &descriptor);
-        if (ret != 0) {
-            continue;
-        }
-
-        if (descriptor.idVendor != GFXLINK_USB_VID ||
-            descriptor.idProduct != GFXLINK_USB_PID) {
-            continue;
-        }
-
-        found = true;
-        ret = libusb_open(devices[i], out_device);
-        if (ret == 0) {
-            open_error = 0;
-            break;
-        }
-
-        open_error = ret;
-    }
-
-    libusb_free_device_list(devices, 1);
-
-    if (!found) {
-        return LIBUSB_ERROR_NOT_FOUND;
-    }
-    return open_error;
-}
-
-static uint32_t float_bits(float value)
-{
-    uint32_t bits;
-    memcpy(&bits, &value, sizeof(bits));
-    return htole32(bits);
-}
-
-static int32_t response_status(const void *payload)
-{
-    int32_t value;
-    memcpy(&value, payload, sizeof(value));
-    return (int32_t)le32toh((uint32_t)value);
-}
-
-static int request(libusb_device_handle *device,
-                   uint8_t opcode,
-                   const void *payload,
-                   uint32_t payload_size,
-                   void *response,
-                   uint32_t response_capacity,
-                   uint32_t *response_size)
-{
-    uint8_t tx[sizeof(gfxlink_header_t) + GFXLINK_MAX_PAYLOAD];
-    uint8_t rx[sizeof(gfxlink_header_t) + GFXLINK_MAX_PAYLOAD];
-
-    if (!device || !response_size || payload_size > GFXLINK_MAX_PAYLOAD ||
-        (payload_size > 0 && !payload)) {
-        return LIBUSB_ERROR_INVALID_PARAM;
-    }
-
-    gfxlink_header_t header = {
-        .magic = htole32(GFXLINK_MAGIC),
-        .version = GFXLINK_PROTOCOL_VERSION,
-        .opcode = opcode,
-        .flags = htole16(0),
-        .sequence = htole32(s_sequence),
-        .payload_size = htole32(payload_size),
-    };
-
-    memcpy(tx, &header, sizeof(header));
-    if (payload_size > 0) {
-        memcpy(tx + sizeof(header), payload, payload_size);
-    }
-
-    int transferred = 0;
-    int ret = libusb_bulk_transfer(
-        device,
-        GFXLINK_USB_EP_OUT,
-        tx,
-        (int)(sizeof(header) + payload_size),
-        &transferred,
-        GFXLINK_TIMEOUT_MS
-    );
-    if (ret != 0) {
-        return ret;
-    }
-    if (transferred != (int)(sizeof(header) + payload_size)) {
-        return LIBUSB_ERROR_IO;
-    }
-
-    size_t received = 0;
-    size_t expected = 0;
-    while (expected == 0 || received < expected) {
-        if (received == sizeof(rx)) {
-            return LIBUSB_ERROR_OVERFLOW;
-        }
-
-        ret = libusb_bulk_transfer(
-            device,
-            GFXLINK_USB_EP_IN,
-            rx + received,
-            (int)(sizeof(rx) - received),
-            &transferred,
-            GFXLINK_TIMEOUT_MS
-        );
-        if (ret != 0) {
-            return ret;
-        }
-        if (transferred <= 0) {
-            return LIBUSB_ERROR_IO;
-        }
-
-        received += (size_t)transferred;
-
-        if (expected == 0 && received >= sizeof(gfxlink_header_t)) {
-            gfxlink_header_t incoming;
-            memcpy(&incoming, rx, sizeof(incoming));
-
-            if (le32toh(incoming.magic) != GFXLINK_MAGIC ||
-                incoming.version != GFXLINK_PROTOCOL_VERSION ||
-                incoming.opcode != opcode ||
-                (le16toh(incoming.flags) & GFXLINK_FLAG_RESPONSE) == 0 ||
-                le32toh(incoming.sequence) != s_sequence) {
-                return LIBUSB_ERROR_IO;
-            }
-
-            uint32_t size = le32toh(incoming.payload_size);
-            if (size > GFXLINK_MAX_PAYLOAD) {
-                return LIBUSB_ERROR_OVERFLOW;
-            }
-            expected = sizeof(gfxlink_header_t) + size;
-        }
-    }
-
-    uint32_t size = (uint32_t)(expected - sizeof(gfxlink_header_t));
-    if (size > response_capacity || (size > 0 && !response)) {
-        return LIBUSB_ERROR_OVERFLOW;
-    }
-
-    if (size > 0) {
-        memcpy(response, rx + sizeof(gfxlink_header_t), size);
-    }
-    *response_size = size;
-    s_sequence++;
-    return 0;
-}
-
-static int check_status(const void *payload, uint32_t size)
-{
-    if (!payload || size < sizeof(gfxlink_status_response_t)) {
-        fprintf(stderr, "Malformed GFXLINK response\n");
-        return 1;
-    }
-
-    int32_t status = response_status(payload);
-    if (status != GFXLINK_STATUS_OK) {
-        fprintf(stderr, "GRAPE returned GFXLINK status %" PRId32 "\n", status);
-        return 1;
-    }
-    return 0;
-}
+#include "grape/grape.h"
 
 static int parse_float(const char *text, float *value)
 {
@@ -252,56 +67,70 @@ static void usage(const char *program)
         "Usage:\n"
         "  %s hello\n"
         "  %s info\n"
+        "  %s present\n"
         "  %s rect <x> <y> <width> <height> <RRGGBB|RRGGBBAA>\n"
         "  %s move <handle> <x> <y>\n"
         "  %s color <handle> <RRGGBB|RRGGBBAA>\n"
-        "  %s destroy <handle>\n",
-        program, program, program, program, program, program);
+        "  %s destroy <handle>\n"
+        "  %s upload-test <bytes>\n",
+        program, program, program, program,
+        program, program, program, program);
 }
 
-static int command_hello(libusb_device_handle *device)
+static int print_result(const char *operation, int result)
 {
-    gfxlink_hello_response_t response;
-    uint32_t size = 0;
-    int ret = request(device, GFXLINK_OP_HELLO, NULL, 0,
-                      &response, sizeof(response), &size);
-    if (ret != 0) {
-        fprintf(stderr, "USB error: %s\n", libusb_error_name(ret));
-        return 1;
+    if (result == GRAPE_OK) {
+        return 0;
     }
-    if (size != sizeof(response) || check_status(&response, size) != 0) {
-        return 1;
+    fprintf(stderr, "%s failed: %s (%d)\n",
+            operation, grape_error_name(result), result);
+    return 1;
+}
+
+static int command_hello(grape_device_t *device)
+{
+    grape_hello_info_t info;
+    int result = grape_hello(device, &info);
+    if (result != GRAPE_OK) {
+        return print_result("hello", result);
     }
 
-    printf("GFXLINK v%u capabilities=0x%08" PRIx32 "\n",
-           response.protocol_version,
-           le32toh(response.capabilities));
+    printf("GFXLINK v%u capabilities=0x%08" PRIx32
+           " max_payload=%" PRIu32
+           " max_resource=%" PRIu32 "\n",
+           info.protocol_version,
+           info.capabilities,
+           info.max_payload,
+           info.max_resource_size);
     return 0;
 }
 
-static int command_info(libusb_device_handle *device)
+static int command_info(grape_device_t *device)
 {
-    gfxlink_info_response_t response;
-    uint32_t size = 0;
-    int ret = request(device, GFXLINK_OP_GET_INFO, NULL, 0,
-                      &response, sizeof(response), &size);
-    if (ret != 0) {
-        fprintf(stderr, "USB error: %s\n", libusb_error_name(ret));
-        return 1;
-    }
-    if (size != sizeof(response) || check_status(&response, size) != 0) {
-        return 1;
+    grape_device_info_t info;
+    int result = grape_get_info(device, &info);
+    if (result != GRAPE_OK) {
+        return print_result("info", result);
     }
 
-    printf("display=%" PRIu32 "x%" PRIu32 " format=%" PRIu32 " max_surfaces=%" PRIu32 "\n",
-           le32toh(response.display_width),
-           le32toh(response.display_height),
-           le32toh(response.pixel_format),
-           le32toh(response.max_surfaces));
+    printf("display=%" PRIu32 "x%" PRIu32
+           " format=%" PRIu32
+           " max_surfaces=%" PRIu32
+           " max_resources=%" PRIu32 "\n",
+           info.display_width,
+           info.display_height,
+           info.pixel_format,
+           info.max_surfaces,
+           info.max_resources);
     return 0;
 }
 
-static int command_rect(libusb_device_handle *device, int argc, char **argv)
+static int command_present(grape_device_t *device)
+{
+    return print_result("present", grape_present(device));
+}
+
+static int command_rect(grape_device_t *device, int argc, char **argv)
 {
     if (argc != 7) {
         return 2;
@@ -309,53 +138,43 @@ static int command_rect(libusb_device_handle *device, int argc, char **argv)
 
     float x = 0.0f;
     float y = 0.0f;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint8_t r = 0, g = 0, b = 0, a = 0;
+    uint32_t width = 0U;
+    uint32_t height = 0U;
+    uint8_t r = 0U, g = 0U, b = 0U, a = 0U;
 
     if (parse_float(argv[2], &x) != 0 ||
         parse_float(argv[3], &y) != 0 ||
         parse_u32(argv[4], &width) != 0 ||
         parse_u32(argv[5], &height) != 0 ||
-        width == 0 || height == 0 ||
+        width == 0U || height == 0U ||
         parse_color(argv[6], &r, &g, &b, &a) != 0) {
         return 2;
     }
 
-    gfxlink_create_solid_surface_request_t request_payload = {
-        .width = htole32(width),
-        .height = htole32(height),
-        .x_bits = float_bits(x),
-        .y_bits = float_bits(y),
-        .r = r,
-        .g = g,
-        .b = b,
-        .a = a,
-    };
-    gfxlink_create_surface_response_t response;
-    uint32_t size = 0;
-    int ret = request(device, GFXLINK_OP_CREATE_SOLID_SURFACE,
-                      &request_payload, sizeof(request_payload),
-                      &response, sizeof(response), &size);
-    if (ret != 0) {
-        fprintf(stderr, "USB error: %s\n", libusb_error_name(ret));
-        return 1;
-    }
-    if (size != sizeof(response) || check_status(&response, size) != 0) {
-        return 1;
+    grape_handle_t handle = 0U;
+    int result = grape_create_solid_surface(
+        device, x, y, width, height, r, g, b, a, &handle
+    );
+    if (result != GRAPE_OK) {
+        return print_result("rect", result);
     }
 
-    printf("handle=%" PRIu32 "\n", le32toh(response.handle));
+    result = grape_present(device);
+    if (result != GRAPE_OK) {
+        return print_result("present", result);
+    }
+
+    printf("handle=%" PRIu32 "\n", handle);
     return 0;
 }
 
-static int command_move(libusb_device_handle *device, int argc, char **argv)
+static int command_move(grape_device_t *device, int argc, char **argv)
 {
     if (argc != 5) {
         return 2;
     }
 
-    uint32_t handle = 0;
+    uint32_t handle = 0U;
     float x = 0.0f;
     float y = 0.0f;
     if (parse_u32(argv[2], &handle) != 0 ||
@@ -364,106 +183,113 @@ static int command_move(libusb_device_handle *device, int argc, char **argv)
         return 2;
     }
 
-    gfxlink_set_surface_position_request_t request_payload = {
-        .handle = htole32(handle),
-        .x_bits = float_bits(x),
-        .y_bits = float_bits(y),
-    };
-    gfxlink_status_response_t response;
-    uint32_t size = 0;
-    int ret = request(device, GFXLINK_OP_SET_SURFACE_POSITION,
-                      &request_payload, sizeof(request_payload),
-                      &response, sizeof(response), &size);
-    if (ret != 0) {
-        fprintf(stderr, "USB error: %s\n", libusb_error_name(ret));
-        return 1;
+    int result = grape_surface_set_position(device, handle, x, y);
+    if (result != GRAPE_OK) {
+        return print_result("move", result);
     }
-    return check_status(&response, size);
+    return print_result("present", grape_present(device));
 }
 
-static int command_color(libusb_device_handle *device, int argc, char **argv)
+static int command_color(grape_device_t *device, int argc, char **argv)
 {
     if (argc != 4) {
         return 2;
     }
 
-    uint32_t handle = 0;
-    uint8_t r = 0, g = 0, b = 0, a = 0;
+    uint32_t handle = 0U;
+    uint8_t r = 0U, g = 0U, b = 0U, a = 0U;
     if (parse_u32(argv[2], &handle) != 0 ||
         parse_color(argv[3], &r, &g, &b, &a) != 0) {
         return 2;
     }
 
-    gfxlink_set_surface_color_request_t request_payload = {
-        .handle = htole32(handle),
-        .r = r,
-        .g = g,
-        .b = b,
-        .a = a,
-    };
-    gfxlink_status_response_t response;
-    uint32_t size = 0;
-    int ret = request(device, GFXLINK_OP_SET_SURFACE_COLOR,
-                      &request_payload, sizeof(request_payload),
-                      &response, sizeof(response), &size);
-    if (ret != 0) {
-        fprintf(stderr, "USB error: %s\n", libusb_error_name(ret));
-        return 1;
+    int result = grape_surface_set_color(device, handle, r, g, b, a);
+    if (result != GRAPE_OK) {
+        return print_result("color", result);
     }
-    return check_status(&response, size);
+    return print_result("present", grape_present(device));
 }
 
-static int command_destroy(libusb_device_handle *device, int argc, char **argv)
+static int command_destroy(grape_device_t *device, int argc, char **argv)
 {
     if (argc != 3) {
         return 2;
     }
 
-    uint32_t handle = 0;
+    uint32_t handle = 0U;
     if (parse_u32(argv[2], &handle) != 0) {
         return 2;
     }
 
-    gfxlink_destroy_surface_request_t request_payload = {
-        .handle = htole32(handle),
-    };
-    gfxlink_status_response_t response;
-    uint32_t size = 0;
-    int ret = request(device, GFXLINK_OP_DESTROY_SURFACE,
-                      &request_payload, sizeof(request_payload),
-                      &response, sizeof(response), &size);
-    if (ret != 0) {
-        fprintf(stderr, "USB error: %s\n", libusb_error_name(ret));
-        return 1;
+    int result = grape_surface_destroy(device, handle);
+    if (result != GRAPE_OK) {
+        return print_result("destroy", result);
     }
-    return check_status(&response, size);
+    return print_result("present", grape_present(device));
 }
 
-static int dispatch(libusb_device_handle *device, int argc, char **argv)
+static double elapsed_seconds(const struct timespec *start, const struct timespec *end)
 {
-    if (argc < 2) {
+    return (double)(end->tv_sec - start->tv_sec) +
+           (double)(end->tv_nsec - start->tv_nsec) / 1000000000.0;
+}
+
+static int command_upload_test(grape_device_t *device, int argc, char **argv)
+{
+    if (argc != 3) {
         return 2;
     }
 
-    if (!strcmp(argv[1], "hello") && argc == 2) {
-        return command_hello(device);
+    uint32_t size = 0U;
+    if (parse_u32(argv[2], &size) != 0 ||
+        size == 0U || size > GFXLINK_MAX_RESOURCE_SIZE) {
+        return 2;
     }
-    if (!strcmp(argv[1], "info") && argc == 2) {
-        return command_info(device);
+
+    uint8_t *data = malloc(size);
+    if (!data) {
+        fprintf(stderr, "Unable to allocate %" PRIu32 " bytes\n", size);
+        return 1;
     }
-    if (!strcmp(argv[1], "rect")) {
-        return command_rect(device, argc, argv);
+
+    for (uint32_t i = 0U; i < size; ++i) {
+        data[i] = (uint8_t)((i * 131U + 17U) & 0xffU);
     }
-    if (!strcmp(argv[1], "move")) {
-        return command_move(device, argc, argv);
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    grape_handle_t handle = 0U;
+    int result = grape_resource_upload(
+        device,
+        GFXLINK_RESOURCE_GENERIC,
+        data,
+        size,
+        &handle
+    );
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    free(data);
+
+    if (result != GRAPE_OK) {
+        return print_result("upload-test", result);
     }
-    if (!strcmp(argv[1], "color")) {
-        return command_color(device, argc, argv);
+
+    double seconds = elapsed_seconds(&start, &end);
+    double mib = (double)size / (1024.0 * 1024.0);
+    double throughput = seconds > 0.0 ? mib / seconds : 0.0;
+
+    printf("resource=%" PRIu32
+           " uploaded=%" PRIu32
+           " bytes time=%.3f s throughput=%.2f MiB/s\n",
+           handle, size, seconds, throughput);
+
+    result = grape_resource_destroy(device, handle);
+    if (result != GRAPE_OK) {
+        return print_result("resource destroy", result);
     }
-    if (!strcmp(argv[1], "destroy")) {
-        return command_destroy(device, argc, argv);
-    }
-    return 2;
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -473,49 +299,36 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    libusb_context *usb = NULL;
-    int ret = libusb_init(&usb);
-    if (ret != 0) {
-        fprintf(stderr, "libusb_init failed: %s\n", libusb_error_name(ret));
+    grape_device_t *device = NULL;
+    int result = grape_open(&device);
+    if (result != GRAPE_OK) {
+        fprintf(stderr, "%s\n", grape_error_name(result));
         return 1;
     }
 
-    libusb_device_handle *device = NULL;
-    ret = open_grape_device(usb, &device);
-    if (ret != 0) {
-        if (ret == LIBUSB_ERROR_NOT_FOUND) {
-            fprintf(stderr, "GRAPE %04x:%04x not found\n",
-                    GFXLINK_USB_VID, GFXLINK_USB_PID);
-        } else if (ret == LIBUSB_ERROR_ACCESS) {
-            fprintf(stderr,
-                    "GRAPE %04x:%04x found, but access was denied. "
-                    "Install the udev rule or run as root.\n",
-                    GFXLINK_USB_VID, GFXLINK_USB_PID);
-        } else {
-            fprintf(stderr, "Unable to open GRAPE %04x:%04x: %s\n",
-                    GFXLINK_USB_VID, GFXLINK_USB_PID,
-                    libusb_error_name(ret));
-        }
-        libusb_exit(usb);
-        return 1;
+    int status = 2;
+    if (strcmp(argv[1], "hello") == 0 && argc == 2) {
+        status = command_hello(device);
+    } else if (strcmp(argv[1], "info") == 0 && argc == 2) {
+        status = command_info(device);
+    } else if (strcmp(argv[1], "present") == 0 && argc == 2) {
+        status = command_present(device);
+    } else if (strcmp(argv[1], "rect") == 0) {
+        status = command_rect(device, argc, argv);
+    } else if (strcmp(argv[1], "move") == 0) {
+        status = command_move(device, argc, argv);
+    } else if (strcmp(argv[1], "color") == 0) {
+        status = command_color(device, argc, argv);
+    } else if (strcmp(argv[1], "destroy") == 0) {
+        status = command_destroy(device, argc, argv);
+    } else if (strcmp(argv[1], "upload-test") == 0) {
+        status = command_upload_test(device, argc, argv);
     }
 
-    ret = libusb_claim_interface(device, GFXLINK_USB_INTERFACE);
-    if (ret != 0) {
-        fprintf(stderr, "Unable to claim GFXLINK interface: %s\n",
-                libusb_error_name(ret));
-        libusb_close(device);
-        libusb_exit(usb);
-        return 1;
-    }
+    grape_close(device);
 
-    int result = dispatch(device, argc, argv);
-    if (result == 2) {
+    if (status == 2) {
         usage(argv[0]);
     }
-
-    libusb_release_interface(device, GFXLINK_USB_INTERFACE);
-    libusb_close(device);
-    libusb_exit(usb);
-    return result;
+    return status;
 }
