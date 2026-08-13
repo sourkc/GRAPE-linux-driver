@@ -8,6 +8,7 @@
 #include <linux/usb.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
+#include <linux/workqueue.h>
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
@@ -55,8 +56,17 @@ struct grape_drm_device {
     u32 display_height;
     u32 pixel_format;
 
-    void *scanout_buf;
+    void *scanout_pending_buf;
+    void *scanout_upload_buf;
     size_t scanout_buf_size;
+    struct mutex scanout_lock;
+    struct work_struct scanout_work;
+    bool scanout_pending;
+    bool scanout_stopping;
+    bool scanout_sync_initialized;
+    u64 scanout_submitted;
+    u64 scanout_uploaded;
+    u64 scanout_dropped;
     u32 scanout_texture;
     u32 scanout_surface;
 
@@ -764,16 +774,18 @@ static int grape_scanout_upload(struct grape_drm_device *gdev,
 
 static int grape_fb_to_rgb565(struct grape_drm_device *gdev,
                               struct drm_framebuffer *fb,
-                              const struct iosys_map *src)
+                              const struct iosys_map *src,
+                              void *dst_pixels)
 {
     struct drm_rect rect = DRM_RECT_INIT(0, 0, fb->width, fb->height);
     struct iosys_map dst;
 
     if (fb->width != gdev->display_width ||
-        fb->height != gdev->display_height)
+        fb->height != gdev->display_height ||
+        !dst_pixels)
         return -EINVAL;
 
-    iosys_map_set_vaddr(&dst, gdev->scanout_buf);
+    iosys_map_set_vaddr(&dst, dst_pixels);
 
     switch (fb->format->format) {
     case DRM_FORMAT_RGB565:
@@ -795,6 +807,49 @@ static int grape_fb_to_rgb565(struct grape_drm_device *gdev,
     default:
         return -EINVAL;
     }
+}
+
+static void grape_scanout_work(struct work_struct *work)
+{
+    struct grape_drm_device *gdev =
+        container_of(work, struct grape_drm_device, scanout_work);
+    void *upload_buf;
+    int idx;
+    int ret;
+
+    if (!drm_dev_enter(&gdev->drm, &idx))
+        return;
+
+    for (;;) {
+        mutex_lock(&gdev->scanout_lock);
+        if (gdev->scanout_stopping || !gdev->scanout_pending) {
+            mutex_unlock(&gdev->scanout_lock);
+            break;
+        }
+
+        upload_buf = gdev->scanout_upload_buf;
+        gdev->scanout_upload_buf = gdev->scanout_pending_buf;
+        gdev->scanout_pending_buf = upload_buf;
+        upload_buf = gdev->scanout_upload_buf;
+        gdev->scanout_pending = false;
+        mutex_unlock(&gdev->scanout_lock);
+
+        ret = grape_scanout_upload(gdev, upload_buf,
+                                   (u32)gdev->scanout_buf_size);
+        if (ret) {
+            if (ret != -ENODEV && ret != -ECONNRESET &&
+                ret != -ESHUTDOWN && ret != -ETIMEDOUT)
+                dev_err_ratelimited(&gdev->interface->dev,
+                                    "framebuffer upload failed: %d\n", ret);
+            break;
+        }
+
+        mutex_lock(&gdev->scanout_lock);
+        gdev->scanout_uploaded++;
+        mutex_unlock(&gdev->scanout_lock);
+    }
+
+    drm_dev_exit(idx);
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
@@ -827,16 +882,33 @@ static void grape_plane_atomic_update(struct drm_plane *plane,
     if (ret)
         goto out;
 
-    ret = grape_fb_to_rgb565(gdev, fb, &shadow_state->data[0]);
-    drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
-    if (ret)
+    /*
+     * Never perform USB I/O from the atomic commit path. Convert/copy the
+     * newest framebuffer into the mailbox buffer, then let the worker do the
+     * slow GFXLINK transfer. If another frame arrives while one is in flight,
+     * it simply replaces the pending mailbox image.
+     */
+    mutex_lock(&gdev->scanout_lock);
+    if (gdev->scanout_stopping) {
+        mutex_unlock(&gdev->scanout_lock);
+        drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
         goto out;
+    }
 
-    ret = grape_scanout_upload(gdev, gdev->scanout_buf,
-                               (u32)gdev->scanout_buf_size);
-    if (ret && ret != -ENODEV && ret != -ECONNRESET && ret != -ESHUTDOWN)
-        dev_err_ratelimited(&gdev->interface->dev,
-                            "framebuffer upload failed: %d\n", ret);
+    if (gdev->scanout_pending)
+        gdev->scanout_dropped++;
+
+    ret = grape_fb_to_rgb565(gdev, fb, &shadow_state->data[0],
+                             gdev->scanout_pending_buf);
+    if (!ret) {
+        gdev->scanout_pending = true;
+        gdev->scanout_submitted++;
+    }
+    mutex_unlock(&gdev->scanout_lock);
+
+    drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
+    if (!ret)
+        queue_work(system_long_wq, &gdev->scanout_work);
 
 out:
     drm_dev_exit(idx);
@@ -1082,15 +1154,30 @@ static int grape_usb_probe(struct usb_interface *interface,
         goto err_clear;
     }
 
-    gdev->scanout_buf = kvzalloc(scanout_size, GFP_KERNEL);
-    if (!gdev->scanout_buf) {
+    gdev->scanout_pending_buf = kvzalloc(scanout_size, GFP_KERNEL);
+    if (!gdev->scanout_pending_buf) {
         ret = -ENOMEM;
         goto err_clear;
     }
-    ret = devm_add_action_or_reset(dev, grape_kvfree_action, gdev->scanout_buf);
+    ret = devm_add_action_or_reset(dev, grape_kvfree_action,
+                                   gdev->scanout_pending_buf);
     if (ret)
         goto err_clear;
+
+    gdev->scanout_upload_buf = kvzalloc(scanout_size, GFP_KERNEL);
+    if (!gdev->scanout_upload_buf) {
+        ret = -ENOMEM;
+        goto err_clear;
+    }
+    ret = devm_add_action_or_reset(dev, grape_kvfree_action,
+                                   gdev->scanout_upload_buf);
+    if (ret)
+        goto err_clear;
+
     gdev->scanout_buf_size = scanout_size;
+    mutex_init(&gdev->scanout_lock);
+    INIT_WORK(&gdev->scanout_work, grape_scanout_work);
+    gdev->scanout_sync_initialized = true;
 
     ret = grape_modeset_init(gdev);
     if (ret) {
@@ -1105,13 +1192,20 @@ static int grape_usb_probe(struct usb_interface *interface,
     }
 
     dev_info(dev,
-             "GRAPE GFXLINK v%u connected: %ux%u format=%u caps=0x%08x; dumb scanout ready\n",
+             "GRAPE GFXLINK v%u connected: %ux%u format=%u caps=0x%08x; asynchronous dumb scanout ready\n",
              gdev->protocol_version, gdev->display_width, gdev->display_height,
              gdev->pixel_format, gdev->capabilities);
     return 0;
 
 err_clear:
     usb_set_intfdata(interface, NULL);
+    if (gdev->scanout_sync_initialized) {
+        mutex_lock(&gdev->scanout_lock);
+        gdev->scanout_stopping = true;
+        mutex_unlock(&gdev->scanout_lock);
+        cancel_work_sync(&gdev->scanout_work);
+        mutex_destroy(&gdev->scanout_lock);
+    }
     mutex_destroy(&gdev->io_lock);
     usb_put_dev(gdev->udev);
     return ret;
@@ -1120,28 +1214,45 @@ err_clear:
 static void grape_usb_disconnect(struct usb_interface *interface)
 {
     struct grape_drm_device *gdev = usb_get_intfdata(interface);
+    bool physically_gone;
 
     if (!gdev)
         return;
 
     usb_set_intfdata(interface, NULL);
+    physically_gone = gdev->udev->state == USB_STATE_NOTATTACHED;
+
+    /*
+     * Stop accepting new mailbox frames first. cancel_work_sync() may wait
+     * for one already-running USB transaction, but userspace/KWin is no
+     * longer blocked on that transaction because all scanout I/O lives here.
+     */
+    mutex_lock(&gdev->scanout_lock);
+    gdev->scanout_stopping = true;
+    gdev->scanout_pending = false;
+    mutex_unlock(&gdev->scanout_lock);
+
+    if (physically_gone)
+        WRITE_ONCE(gdev->disconnected, true);
+
+    cancel_work_sync(&gdev->scanout_work);
 
     drm_dev_unplug(&gdev->drm);
     drm_atomic_helper_shutdown(&gdev->drm);
 
-    /* On module unload/unbind the USB device is still configured, so release
-     * persistent remote scanout objects. A physical unplug is already gone. */
-    if (gdev->udev->state != USB_STATE_NOTATTACHED)
+    if (!physically_gone)
         grape_scanout_cleanup_remote(gdev);
 
-    mutex_lock(&gdev->io_lock);
-    gdev->disconnected = true;
-    mutex_unlock(&gdev->io_lock);
+    WRITE_ONCE(gdev->disconnected, true);
 
-    usb_put_dev(gdev->udev);
+    dev_info(&interface->dev,
+             "GRAPE GFXLINK disconnected (submitted=%llu uploaded=%llu dropped=%llu)\n",
+             gdev->scanout_submitted, gdev->scanout_uploaded,
+             gdev->scanout_dropped);
+
+    mutex_destroy(&gdev->scanout_lock);
     mutex_destroy(&gdev->io_lock);
-
-    dev_info(&interface->dev, "GRAPE GFXLINK disconnected\n");
+    usb_put_dev(gdev->udev);
 }
 
 static const struct usb_device_id grape_usb_ids[] = {
@@ -1162,4 +1273,4 @@ module_usb_driver(grape_usb_driver);
 MODULE_AUTHOR("GRAPE project");
 MODULE_DESCRIPTION(GRAPE_DRM_DESC);
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.3.1");
+MODULE_VERSION("0.3.1a");

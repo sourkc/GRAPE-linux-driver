@@ -9,7 +9,11 @@ GRAPE RGB565 texture and surface.
 
 This is deliberately still unaccelerated scanout. Each plane update currently
 uploads the full 720x1280 frame through the existing reliable GFXLINK resource
-stream. Damage-rectangle scanout belongs to M3.2.
+stream. The USB upload runs on a workqueue, never inside the DRM atomic commit
+path. The driver keeps a one-frame mailbox: if Linux submits more frames while
+one is uploading, only the newest pending frame is retained.
+
+Damage-rectangle scanout belongs to M3.2.
 
 ## Build
 
@@ -54,7 +58,9 @@ modetest -M grape -s <connector_id>@<crtc_id>:720x1280-60
 
 `modetest` should allocate a dumb framebuffer and put its default test pattern
 on the physical GRAPE panel. The first frame can take hundreds of milliseconds
-because M3.1 intentionally uses the existing ~5 MiB/s full-frame upload path.
+because M3.1 intentionally uses the existing ~5 MiB/s full-frame upload path,
+but that transfer happens asynchronously and must not stall the compositor or
+the VM's other displays.
 
 Unload the module to return the USB interface to `libusb`/`grapectl`:
 
