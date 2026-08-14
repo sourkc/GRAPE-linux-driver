@@ -39,11 +39,14 @@
 #define GRAPE_DRM_USB_TIMEOUT_MS 3000
 #define GRAPE_RESOURCE_MAX_COMMIT_ATTEMPTS 4U
 #define GRAPE_IO_BUFFER_SIZE (sizeof(gfxlink_header_t) + GFXLINK_MAX_PAYLOAD)
-#define GRAPE_DAMAGE_MAX_RECTS 8U
-#define GRAPE_DAMAGE_FULL_PERCENT 70U
+#define GRAPE_DIFF_TILE_SIZE 32U
+#define GRAPE_DIFF_MAX_RECTS 8U
+#define GRAPE_DIFF_MAX_CANDIDATE_RECTS 64U
+#define GRAPE_DIFF_FULL_PERCENT 70U
+#define GRAPE_DIFF_MERGE_BUDGET_BYTES (32U * 1024U)
 
 struct grape_damage_set {
-    struct drm_rect rects[GRAPE_DAMAGE_MAX_RECTS];
+    struct drm_rect rects[GRAPE_DIFF_MAX_CANDIDATE_RECTS];
     u32 count;
 };
 
@@ -68,21 +71,28 @@ struct grape_drm_device {
 
     void *scanout_pending_buf;
     void *scanout_upload_buf;
+    void *scanout_displayed_buf;
     void *scanout_rect_buf;
+    u8 *scanout_tile_map;
     size_t scanout_buf_size;
+    u32 scanout_tiles_x;
+    u32 scanout_tiles_y;
+    u32 scanout_tile_count;
     struct mutex scanout_lock;
     struct work_struct scanout_work;
     bool scanout_pending;
-    bool scanout_force_full;
+    bool scanout_displayed_valid;
     bool scanout_stopping;
     bool scanout_sync_initialized;
-    struct grape_damage_set scanout_pending_damage;
     u64 scanout_submitted;
     u64 scanout_uploaded;
     u64 scanout_dropped;
     u64 scanout_rects_uploaded;
     u64 scanout_bytes_uploaded;
-    u64 scanout_damage_collapses;
+    u64 scanout_unchanged;
+    u64 scanout_dirty_tiles;
+    u64 scanout_full_fallbacks;
+    u64 scanout_rect_merges;
     u32 scanout_texture;
     u32 scanout_surface;
 
@@ -791,44 +801,83 @@ static bool grape_damage_is_full(struct grape_drm_device *gdev,
            rect->y2 == gdev->display_height;
 }
 
-static bool grape_rect_contains(const struct drm_rect *outer,
-                                const struct drm_rect *inner)
+static struct drm_rect grape_rect_union(const struct drm_rect *a,
+                                        const struct drm_rect *b)
 {
-    return outer->x1 <= inner->x1 && outer->y1 <= inner->y1 &&
-           outer->x2 >= inner->x2 && outer->y2 >= inner->y2;
+    struct drm_rect rect = {
+        .x1 = min(a->x1, b->x1),
+        .y1 = min(a->y1, b->y1),
+        .x2 = max(a->x2, b->x2),
+        .y2 = max(a->y2, b->y2),
+    };
+
+    return rect;
 }
 
-static bool grape_damage_add(struct grape_drm_device *gdev,
-                             struct grape_damage_set *damage,
-                             const struct drm_rect *input)
+static bool grape_scanout_tile_changed(struct grape_drm_device *gdev,
+                                       const u8 *current_frame,
+                                       const u8 *displayed,
+                                       u32 tile_x,
+                                       u32 tile_y)
 {
-    struct drm_rect rect = *input;
-    u32 i;
+    u32 x1 = tile_x * GRAPE_DIFF_TILE_SIZE;
+    u32 y1 = tile_y * GRAPE_DIFF_TILE_SIZE;
+    u32 x2 = min_t(u32, x1 + GRAPE_DIFF_TILE_SIZE, gdev->display_width);
+    u32 y2 = min_t(u32, y1 + GRAPE_DIFF_TILE_SIZE, gdev->display_height);
+    u32 row_bytes = (x2 - x1) * 2U;
+    u32 pitch = gdev->display_width * 2U;
+    u32 y;
 
-    rect.x1 = clamp_t(int, rect.x1, 0, gdev->display_width);
-    rect.y1 = clamp_t(int, rect.y1, 0, gdev->display_height);
-    rect.x2 = clamp_t(int, rect.x2, 0, gdev->display_width);
-    rect.y2 = clamp_t(int, rect.y2, 0, gdev->display_height);
-    if (!drm_rect_visible(&rect))
-        return true;
+    for (y = y1; y < y2; ++y) {
+        size_t offset = (size_t)y * pitch + (size_t)x1 * 2U;
 
-    if (grape_damage_is_full(gdev, damage))
-        return true;
-
-    for (i = 0; i < damage->count; ++i) {
-        if (grape_rect_contains(&damage->rects[i], &rect))
+        if (memcmp(current_frame + offset, displayed + offset, row_bytes))
             return true;
-        if (grape_rect_contains(&rect, &damage->rects[i])) {
-            damage->rects[i] = rect;
-            return true;
-        }
     }
 
-    if (damage->count == GRAPE_DAMAGE_MAX_RECTS)
-        return false;
+    return false;
+}
 
-    damage->rects[damage->count++] = rect;
-    return true;
+static void grape_damage_reduce(struct grape_drm_device *gdev,
+                                struct grape_damage_set *damage)
+{
+    while (damage->count > 1) {
+        struct drm_rect best_union = { 0 };
+        u64 best_extra_bytes = U64_MAX;
+        u32 best_i = 0;
+        u32 best_j = 0;
+        u32 i;
+        u32 j;
+
+        for (i = 0; i < damage->count; ++i) {
+            for (j = i + 1; j < damage->count; ++j) {
+                struct drm_rect joined =
+                    grape_rect_union(&damage->rects[i], &damage->rects[j]);
+                u64 joined_area = grape_rect_area(&joined);
+                u64 separate_area = grape_rect_area(&damage->rects[i]) +
+                                    grape_rect_area(&damage->rects[j]);
+                u64 extra_pixels = joined_area > separate_area ?
+                                   joined_area - separate_area : 0;
+                u64 extra_bytes = extra_pixels * 2U;
+
+                if (extra_bytes < best_extra_bytes) {
+                    best_extra_bytes = extra_bytes;
+                    best_union = joined;
+                    best_i = i;
+                    best_j = j;
+                }
+            }
+        }
+
+        if (damage->count <= GRAPE_DIFF_MAX_RECTS &&
+            best_extra_bytes > GRAPE_DIFF_MERGE_BUDGET_BYTES)
+            break;
+
+        damage->rects[best_i] = best_union;
+        damage->rects[best_j] = damage->rects[damage->count - 1];
+        damage->count--;
+        gdev->scanout_rect_merges++;
+    }
 }
 
 static bool grape_damage_should_full(struct grape_drm_device *gdev,
@@ -844,7 +893,109 @@ static bool grape_damage_should_full(struct grape_drm_device *gdev,
     for (i = 0; i < damage->count; ++i)
         damaged_pixels += grape_rect_area(&damage->rects[i]);
 
-    return damaged_pixels * 100U >= full_pixels * GRAPE_DAMAGE_FULL_PERCENT;
+    return damaged_pixels * 100U >= full_pixels * GRAPE_DIFF_FULL_PERCENT;
+}
+
+static void grape_scanout_diff(struct grape_drm_device *gdev,
+                               const u8 *current_frame,
+                               struct grape_damage_set *damage)
+{
+    u32 dirty_tiles = 0;
+    u32 tile_y;
+
+    grape_damage_clear(damage);
+
+    if (!gdev->scanout_displayed_valid) {
+        grape_damage_make_full(gdev, damage);
+        gdev->scanout_full_fallbacks++;
+        return;
+    }
+
+    memset(gdev->scanout_tile_map, 0, gdev->scanout_tile_count);
+    for (tile_y = 0; tile_y < gdev->scanout_tiles_y; ++tile_y) {
+        u32 tile_x;
+
+        for (tile_x = 0; tile_x < gdev->scanout_tiles_x; ++tile_x) {
+            u32 index = tile_y * gdev->scanout_tiles_x + tile_x;
+
+            if (!grape_scanout_tile_changed(gdev, current_frame,
+                                             gdev->scanout_displayed_buf,
+                                             tile_x, tile_y))
+                continue;
+
+            gdev->scanout_tile_map[index] = 1;
+            dirty_tiles++;
+        }
+    }
+
+    gdev->scanout_dirty_tiles += dirty_tiles;
+    if (!dirty_tiles)
+        return;
+
+    if ((u64)dirty_tiles * 100U >=
+        (u64)gdev->scanout_tile_count * GRAPE_DIFF_FULL_PERCENT) {
+        grape_damage_make_full(gdev, damage);
+        gdev->scanout_full_fallbacks++;
+        return;
+    }
+
+    for (tile_y = 0; tile_y < gdev->scanout_tiles_y; ++tile_y) {
+        u32 tile_x = 0;
+
+        while (tile_x < gdev->scanout_tiles_x) {
+            struct drm_rect rect;
+            u32 start_x;
+            u32 i;
+            bool extended = false;
+
+            while (tile_x < gdev->scanout_tiles_x &&
+                   !gdev->scanout_tile_map[tile_y * gdev->scanout_tiles_x + tile_x])
+                tile_x++;
+            if (tile_x == gdev->scanout_tiles_x)
+                break;
+
+            start_x = tile_x;
+            while (tile_x < gdev->scanout_tiles_x &&
+                   gdev->scanout_tile_map[tile_y * gdev->scanout_tiles_x + tile_x])
+                tile_x++;
+
+            rect = DRM_RECT_INIT(start_x * GRAPE_DIFF_TILE_SIZE,
+                                 tile_y * GRAPE_DIFF_TILE_SIZE,
+                                 min_t(u32, tile_x * GRAPE_DIFF_TILE_SIZE,
+                                       gdev->display_width) -
+                                     start_x * GRAPE_DIFF_TILE_SIZE,
+                                 min_t(u32, (tile_y + 1) * GRAPE_DIFF_TILE_SIZE,
+                                       gdev->display_height) -
+                                     tile_y * GRAPE_DIFF_TILE_SIZE);
+
+            for (i = 0; i < damage->count; ++i) {
+                if (damage->rects[i].x1 == rect.x1 &&
+                    damage->rects[i].x2 == rect.x2 &&
+                    damage->rects[i].y2 == rect.y1) {
+                    damage->rects[i].y2 = rect.y2;
+                    extended = true;
+                    break;
+                }
+            }
+
+            if (extended)
+                continue;
+
+            if (damage->count == GRAPE_DIFF_MAX_CANDIDATE_RECTS) {
+                grape_damage_make_full(gdev, damage);
+                gdev->scanout_full_fallbacks++;
+                return;
+            }
+
+            damage->rects[damage->count++] = rect;
+        }
+    }
+
+    grape_damage_reduce(gdev, damage);
+    if (grape_damage_should_full(gdev, damage)) {
+        grape_damage_make_full(gdev, damage);
+        gdev->scanout_full_fallbacks++;
+    }
 }
 
 static u32 grape_scanout_pack_rect(struct grape_drm_device *gdev,
@@ -918,6 +1069,35 @@ static int grape_scanout_upload_damage(struct grape_drm_device *gdev,
     return grape_remote_present(gdev);
 }
 
+static void grape_scanout_commit_displayed(struct grape_drm_device *gdev,
+                                           const u8 *pixels,
+                                           const struct grape_damage_set *damage)
+{
+    u32 pitch = gdev->display_width * 2U;
+    u32 i;
+
+    if (grape_damage_is_full(gdev, damage)) {
+        memcpy(gdev->scanout_displayed_buf, pixels, gdev->scanout_buf_size);
+        gdev->scanout_displayed_valid = true;
+        return;
+    }
+
+    for (i = 0; i < damage->count; ++i) {
+        const struct drm_rect *rect = &damage->rects[i];
+        u32 row_bytes = drm_rect_width(rect) * 2U;
+        u32 y;
+
+        for (y = rect->y1; y < rect->y2; ++y) {
+            size_t offset = (size_t)y * pitch + (size_t)rect->x1 * 2U;
+
+            memcpy((u8 *)gdev->scanout_displayed_buf + offset,
+                   pixels + offset, row_bytes);
+        }
+    }
+
+    gdev->scanout_displayed_valid = true;
+}
+
 static int grape_fb_rect_to_rgb565(struct grape_drm_device *gdev,
                                    struct drm_framebuffer *fb,
                                    const struct iosys_map *src,
@@ -980,29 +1160,34 @@ static void grape_scanout_work(struct work_struct *work)
         gdev->scanout_upload_buf = gdev->scanout_pending_buf;
         gdev->scanout_pending_buf = upload_buf;
         upload_buf = gdev->scanout_upload_buf;
-        damage = gdev->scanout_pending_damage;
-        grape_damage_clear(&gdev->scanout_pending_damage);
         gdev->scanout_pending = false;
         mutex_unlock(&gdev->scanout_lock);
+
+        grape_scanout_diff(gdev, upload_buf, &damage);
+        if (!damage.count) {
+            gdev->scanout_unchanged++;
+            continue;
+        }
 
         ret = grape_scanout_upload_damage(gdev, upload_buf, &damage);
         if (ret) {
             if (ret != -ENODEV && ret != -ECONNRESET &&
                 ret != -ESHUTDOWN && ret != -ETIMEDOUT)
                 dev_err_ratelimited(&gdev->interface->dev,
-                                    "framebuffer damage upload failed: %d\n", ret);
+                                    "framebuffer diff upload failed: %d\n", ret);
 
             mutex_lock(&gdev->scanout_lock);
-            gdev->scanout_force_full = true;
-            grape_damage_clear(&gdev->scanout_pending_damage);
-            gdev->scanout_pending = false;
+            gdev->scanout_displayed_valid = false;
+            if (gdev->scanout_pending) {
+                gdev->scanout_pending = false;
+                gdev->scanout_dropped++;
+            }
             mutex_unlock(&gdev->scanout_lock);
             break;
         }
 
-        mutex_lock(&gdev->scanout_lock);
+        grape_scanout_commit_displayed(gdev, upload_buf, &damage);
         gdev->scanout_uploaded++;
-        mutex_unlock(&gdev->scanout_lock);
     }
 
     drm_dev_exit(idx);
@@ -1047,11 +1232,10 @@ static void grape_plane_atomic_update(struct drm_plane *plane,
 {
     struct grape_drm_device *gdev = to_grape(plane->dev);
     struct drm_plane_state *new_state;
-    struct drm_plane_state *old_state = NULL;
     struct drm_shadow_plane_state *shadow_state;
     struct drm_format_conv_state conv_state = DRM_FORMAT_CONV_STATE_INIT;
     struct drm_framebuffer *fb;
-    struct drm_rect damage;
+    struct drm_rect full;
     bool had_pending;
     bool copied = false;
     int idx;
@@ -1061,7 +1245,6 @@ static void grape_plane_atomic_update(struct drm_plane *plane,
     (void)state;
     new_state = plane->state;
 #else
-    old_state = drm_atomic_get_old_plane_state(state, plane);
     new_state = drm_atomic_get_new_plane_state(state, plane);
 #endif
 
@@ -1085,83 +1268,23 @@ static void grape_plane_atomic_update(struct drm_plane *plane,
     }
 
     had_pending = gdev->scanout_pending;
-
-    if (gdev->scanout_force_full || !old_state) {
-        damage = DRM_RECT_INIT(0, 0, gdev->display_width, gdev->display_height);
-        grape_damage_clear(&gdev->scanout_pending_damage);
-        ret = grape_fb_rect_to_rgb565(gdev, fb, &shadow_state->data[0],
-                                      &damage, gdev->scanout_pending_buf,
-                                      &conv_state);
-        if (!ret) {
-            grape_damage_make_full(gdev, &gdev->scanout_pending_damage);
-            gdev->scanout_force_full = false;
-            copied = true;
-        }
-    } else {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
-        damage = DRM_RECT_INIT(0, 0, gdev->display_width, gdev->display_height);
-        ret = grape_fb_rect_to_rgb565(gdev, fb, &shadow_state->data[0],
-                                      &damage, gdev->scanout_pending_buf,
-                                      &conv_state);
-        if (!ret) {
-            grape_damage_make_full(gdev, &gdev->scanout_pending_damage);
-            copied = true;
-        }
-#else
-        struct drm_atomic_helper_damage_iter iter;
-
-        drm_atomic_helper_damage_iter_init(&iter, old_state, new_state);
-        drm_atomic_for_each_plane_damage(&iter, &damage) {
-            ret = grape_fb_rect_to_rgb565(gdev, fb, &shadow_state->data[0],
-                                          &damage, gdev->scanout_pending_buf,
-                                          &conv_state);
-            if (ret)
-                break;
-            copied = true;
-            if (!grape_damage_add(gdev, &gdev->scanout_pending_damage, &damage)) {
-                damage = DRM_RECT_INIT(0, 0, gdev->display_width,
-                                       gdev->display_height);
-                ret = grape_fb_rect_to_rgb565(gdev, fb, &shadow_state->data[0],
-                                              &damage, gdev->scanout_pending_buf,
-                                              &conv_state);
-                if (!ret) {
-                    grape_damage_make_full(gdev, &gdev->scanout_pending_damage);
-                    gdev->scanout_damage_collapses++;
-                }
-                break;
-            }
-        }
-#endif
-    }
-
-    if (!ret && copied &&
-        grape_damage_should_full(gdev, &gdev->scanout_pending_damage)) {
-        damage = DRM_RECT_INIT(0, 0, gdev->display_width, gdev->display_height);
-        ret = grape_fb_rect_to_rgb565(gdev, fb, &shadow_state->data[0],
-                                      &damage, gdev->scanout_pending_buf,
-                                      &conv_state);
-        if (!ret) {
-            grape_damage_make_full(gdev, &gdev->scanout_pending_damage);
-            gdev->scanout_damage_collapses++;
-        }
-    }
-
-    if (copied && !ret) {
+    full = DRM_RECT_INIT(0, 0, gdev->display_width, gdev->display_height);
+    ret = grape_fb_rect_to_rgb565(gdev, fb, &shadow_state->data[0],
+                                  &full, gdev->scanout_pending_buf,
+                                  &conv_state);
+    if (!ret) {
         if (had_pending)
             gdev->scanout_dropped++;
         gdev->scanout_pending = true;
         gdev->scanout_submitted++;
-    } else if (ret) {
-        gdev->scanout_force_full = true;
-        if (!had_pending)
-            grape_damage_clear(&gdev->scanout_pending_damage);
+        copied = true;
     }
     mutex_unlock(&gdev->scanout_lock);
 
 out_cpu:
     drm_format_conv_state_release(&conv_state);
     drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
-    if (copied && !ret)
+    if (copied)
         queue_work(system_long_wq, &gdev->scanout_work);
 out:
     drm_dev_exit(idx);
@@ -1329,7 +1452,7 @@ static const struct drm_driver grape_drm_driver = {
     .desc = GRAPE_DRM_DESC,
     .major = 0,
     .minor = 5,
-    .patchlevel = 0,
+    .patchlevel = 1,
 };
 
 static int grape_usb_probe(struct usb_interface *interface,
@@ -1434,6 +1557,16 @@ static int grape_usb_probe(struct usb_interface *interface,
     if (ret)
         goto err_clear;
 
+    gdev->scanout_displayed_buf = kvzalloc(scanout_size, GFP_KERNEL);
+    if (!gdev->scanout_displayed_buf) {
+        ret = -ENOMEM;
+        goto err_clear;
+    }
+    ret = devm_add_action_or_reset(dev, grape_kvfree_action,
+                                   gdev->scanout_displayed_buf);
+    if (ret)
+        goto err_clear;
+
     gdev->scanout_rect_buf = kvzalloc(scanout_size, GFP_KERNEL);
     if (!gdev->scanout_rect_buf) {
         ret = -ENOMEM;
@@ -1444,10 +1577,26 @@ static int grape_usb_probe(struct usb_interface *interface,
     if (ret)
         goto err_clear;
 
+    gdev->scanout_tiles_x = DIV_ROUND_UP(gdev->display_width, GRAPE_DIFF_TILE_SIZE);
+    gdev->scanout_tiles_y = DIV_ROUND_UP(gdev->display_height, GRAPE_DIFF_TILE_SIZE);
+    if (gdev->scanout_tiles_x > U32_MAX / gdev->scanout_tiles_y) {
+        ret = -EOVERFLOW;
+        goto err_clear;
+    }
+    gdev->scanout_tile_count = gdev->scanout_tiles_x * gdev->scanout_tiles_y;
+    gdev->scanout_tile_map = kvzalloc(gdev->scanout_tile_count, GFP_KERNEL);
+    if (!gdev->scanout_tile_map) {
+        ret = -ENOMEM;
+        goto err_clear;
+    }
+    ret = devm_add_action_or_reset(dev, grape_kvfree_action,
+                                   gdev->scanout_tile_map);
+    if (ret)
+        goto err_clear;
+
     gdev->scanout_buf_size = scanout_size;
     mutex_init(&gdev->scanout_lock);
-    gdev->scanout_force_full = true;
-    grape_damage_clear(&gdev->scanout_pending_damage);
+    gdev->scanout_displayed_valid = false;
     INIT_WORK(&gdev->scanout_work, grape_scanout_work);
     gdev->scanout_sync_initialized = true;
 
@@ -1464,7 +1613,7 @@ static int grape_usb_probe(struct usb_interface *interface,
     }
 
     dev_info(dev,
-             "GRAPE GFXLINK v%u connected: %ux%u format=%u caps=0x%08x; damage-aware asynchronous scanout ready\n",
+             "GRAPE GFXLINK v%u connected: %ux%u format=%u caps=0x%08x; 32x32 framebuffer-diff scanout ready\n",
              gdev->protocol_version, gdev->display_width, gdev->display_height,
              gdev->pixel_format, gdev->capabilities);
     return 0;
@@ -1518,10 +1667,12 @@ static void grape_usb_disconnect(struct usb_interface *interface)
     WRITE_ONCE(gdev->disconnected, true);
 
     dev_info(&interface->dev,
-             "GRAPE GFXLINK disconnected (submitted=%llu uploaded=%llu dropped=%llu rects=%llu bytes=%llu collapses=%llu)\n",
+             "GRAPE GFXLINK disconnected (submitted=%llu uploaded=%llu dropped=%llu unchanged=%llu rects=%llu bytes=%llu dirty_tiles=%llu full=%llu merges=%llu)\n",
              gdev->scanout_submitted, gdev->scanout_uploaded,
-             gdev->scanout_dropped, gdev->scanout_rects_uploaded,
-             gdev->scanout_bytes_uploaded, gdev->scanout_damage_collapses);
+             gdev->scanout_dropped, gdev->scanout_unchanged,
+             gdev->scanout_rects_uploaded, gdev->scanout_bytes_uploaded,
+             gdev->scanout_dirty_tiles, gdev->scanout_full_fallbacks,
+             gdev->scanout_rect_merges);
 
     mutex_destroy(&gdev->scanout_lock);
     mutex_destroy(&gdev->io_lock);
@@ -1546,4 +1697,4 @@ module_usb_driver(grape_usb_driver);
 MODULE_AUTHOR("GRAPE project");
 MODULE_DESCRIPTION(GRAPE_DRM_DESC);
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.5.0");
+MODULE_VERSION("0.5.1");
