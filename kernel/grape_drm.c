@@ -43,7 +43,7 @@
 #define GRAPE_DIFF_MAX_RECTS 8U
 #define GRAPE_DIFF_MAX_CANDIDATE_RECTS 64U
 #define GRAPE_DIFF_FULL_PERCENT 70U
-#define GRAPE_DIFF_MERGE_BUDGET_BYTES (32U * 1024U)
+#define GRAPE_DIFF_MERGE_BUDGET_BYTES (2U * 1024U)
 
 struct grape_damage_set {
     struct drm_rect rects[GRAPE_DIFF_MAX_CANDIDATE_RECTS];
@@ -93,6 +93,7 @@ struct grape_drm_device {
     u64 scanout_dirty_tiles;
     u64 scanout_full_fallbacks;
     u64 scanout_rect_merges;
+    u64 scanout_fast_packets;
     u32 scanout_texture;
     u32 scanout_surface;
 
@@ -676,6 +677,53 @@ static int grape_remote_texture_update(struct grape_drm_device *gdev,
                                 &request, sizeof(request));
 }
 
+static int grape_remote_texture_write_rect(struct grape_drm_device *gdev,
+                                           u32 texture,
+                                           u32 x,
+                                           u32 y,
+                                           u32 width,
+                                           u32 height,
+                                           const u8 *data,
+                                           u32 size)
+{
+    u32 expected_size;
+    u32 offset = 0;
+
+    if (!data || !width || !height || width > U32_MAX / 2U ||
+        height > U32_MAX / (width * 2U))
+        return -EINVAL;
+
+    expected_size = width * height * 2U;
+    if (size != expected_size)
+        return -EINVAL;
+
+    while (offset < size) {
+        u32 chunk = min_t(u32, size - offset,
+                          GFXLINK_TEXTURE_WRITE_RECT_CHUNK_SIZE);
+        gfxlink_texture_write_rect_request_t request = {
+            .texture_handle = cpu_to_le32(texture),
+            .x = cpu_to_le32(x),
+            .y = cpu_to_le32(y),
+            .width = cpu_to_le32(width),
+            .height = cpu_to_le32(height),
+            .data_offset = cpu_to_le32(offset),
+            .data_size = cpu_to_le32(chunk),
+        };
+        int ret = grape_gfxlink_send_parts(gdev,
+                                            GFXLINK_OP_TEXTURE_WRITE_RECT,
+                                            GFXLINK_FLAG_NO_RESPONSE,
+                                            &request, sizeof(request),
+                                            data + offset, chunk);
+        if (ret)
+            return ret;
+
+        offset += chunk;
+        gdev->scanout_fast_packets++;
+    }
+
+    return 0;
+}
+
 static int grape_remote_texture_destroy(struct grape_drm_device *gdev, u32 texture)
 {
     gfxlink_texture_handle_request_t request = {
@@ -1042,25 +1090,37 @@ static int grape_scanout_upload_damage(struct grape_drm_device *gdev,
     for (i = 0; i < damage->count; ++i) {
         const struct drm_rect *rect = &damage->rects[i];
         const u8 *packed;
-        u32 resource = 0;
         u32 size;
-        int cleanup_ret;
 
         size = grape_scanout_pack_rect(gdev, pixels, rect, &packed);
-        ret = grape_resource_upload(gdev, GFXLINK_RESOURCE_TEXTURE,
-                                    packed, size, &resource);
-        if (ret)
-            return ret;
 
-        ret = grape_remote_texture_update(gdev, gdev->scanout_texture, resource,
-                                          rect->x1, rect->y1,
-                                          drm_rect_width(rect),
-                                          drm_rect_height(rect));
-        cleanup_ret = grape_resource_destroy(gdev, resource);
+        if (gdev->capabilities & GFXLINK_CAP_TEXTURE_WRITE_RECT) {
+            ret = grape_remote_texture_write_rect(
+                gdev,
+                gdev->scanout_texture,
+                rect->x1, rect->y1,
+                drm_rect_width(rect), drm_rect_height(rect),
+                packed, size
+            );
+        } else {
+            u32 resource = 0;
+            int cleanup_ret;
+
+            ret = grape_resource_upload(gdev, GFXLINK_RESOURCE_TEXTURE,
+                                        packed, size, &resource);
+            if (!ret) {
+                ret = grape_remote_texture_update(
+                    gdev, gdev->scanout_texture, resource,
+                    rect->x1, rect->y1,
+                    drm_rect_width(rect), drm_rect_height(rect)
+                );
+            }
+            cleanup_ret = resource ? grape_resource_destroy(gdev, resource) : 0;
+            if (!ret && cleanup_ret)
+                ret = cleanup_ret;
+        }
         if (ret)
             return ret;
-        if (cleanup_ret)
-            return cleanup_ret;
 
         gdev->scanout_rects_uploaded++;
         gdev->scanout_bytes_uploaded += size;
@@ -1519,8 +1579,9 @@ static int grape_usb_probe(struct usb_interface *interface,
         !(gdev->capabilities & GFXLINK_CAP_RELIABLE_RESOURCE_STREAM) ||
         !(gdev->capabilities & GFXLINK_CAP_TEXTURES) ||
         !(gdev->capabilities & GFXLINK_CAP_TEXTURE_UPDATE) ||
+        !(gdev->capabilities & GFXLINK_CAP_TEXTURE_WRITE_RECT) ||
         !(gdev->capabilities & GFXLINK_CAP_EXPLICIT_PRESENT)) {
-        dev_err(dev, "firmware lacks M3.1 scanout capabilities (caps=0x%08x)\n",
+        dev_err(dev, "firmware lacks M3.2b scanout capabilities (caps=0x%08x)\n",
                 gdev->capabilities);
         ret = -EOPNOTSUPP;
         goto err_clear;
@@ -1613,7 +1674,7 @@ static int grape_usb_probe(struct usb_interface *interface,
     }
 
     dev_info(dev,
-             "GRAPE GFXLINK v%u connected: %ux%u format=%u caps=0x%08x; 32x32 framebuffer-diff scanout ready\n",
+             "GRAPE GFXLINK v%u connected: %ux%u format=%u caps=0x%08x; 32x32 diff + direct texture-write scanout ready\n",
              gdev->protocol_version, gdev->display_width, gdev->display_height,
              gdev->pixel_format, gdev->capabilities);
     return 0;
@@ -1667,12 +1728,12 @@ static void grape_usb_disconnect(struct usb_interface *interface)
     WRITE_ONCE(gdev->disconnected, true);
 
     dev_info(&interface->dev,
-             "GRAPE GFXLINK disconnected (submitted=%llu uploaded=%llu dropped=%llu unchanged=%llu rects=%llu bytes=%llu dirty_tiles=%llu full=%llu merges=%llu)\n",
+             "GRAPE GFXLINK disconnected (submitted=%llu uploaded=%llu dropped=%llu unchanged=%llu rects=%llu bytes=%llu dirty_tiles=%llu full=%llu merges=%llu fast_packets=%llu)\n",
              gdev->scanout_submitted, gdev->scanout_uploaded,
              gdev->scanout_dropped, gdev->scanout_unchanged,
              gdev->scanout_rects_uploaded, gdev->scanout_bytes_uploaded,
              gdev->scanout_dirty_tiles, gdev->scanout_full_fallbacks,
-             gdev->scanout_rect_merges);
+             gdev->scanout_rect_merges, gdev->scanout_fast_packets);
 
     mutex_destroy(&gdev->scanout_lock);
     mutex_destroy(&gdev->io_lock);
@@ -1697,4 +1758,4 @@ module_usb_driver(grape_usb_driver);
 MODULE_AUTHOR("GRAPE project");
 MODULE_DESCRIPTION(GRAPE_DRM_DESC);
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.5.1");
+MODULE_VERSION("0.5.2");
