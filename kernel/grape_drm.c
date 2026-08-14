@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/completion.h>
 #include <linux/dma-direction.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
+#include <linux/refcount.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
+#include <linux/uaccess.h>
 #include <linux/types.h>
 #include <linux/usb.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
+#include <linux/xarray.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -22,6 +27,7 @@
 #include <drm/drm_format_helper.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_gem.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
@@ -31,8 +37,10 @@
 #include <drm/drm_plane.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_rect.h>
+#include <drm/drm_vma_manager.h>
 
 #include "grape/gfxlink_protocol.h"
+#include "grape/grape_drm.h"
 
 #define GRAPE_DRM_NAME "grape_drm"
 #define GRAPE_DRM_DESC "GRAPE GFXLINK DRM/KMS driver"
@@ -44,10 +52,40 @@
 #define GRAPE_DIFF_MAX_CANDIDATE_RECTS 64U
 #define GRAPE_DIFF_FULL_PERCENT 70U
 #define GRAPE_DIFF_MERGE_BUDGET_BYTES (2U * 1024U)
+#define GRAPE_GPU_WORKQUEUE_NAME "grape-gpu"
 
 struct grape_damage_set {
     struct drm_rect rects[GRAPE_DIFF_MAX_CANDIDATE_RECTS];
     u32 count;
+};
+
+struct grape_drm_device;
+
+struct grape_gpu_context {
+    refcount_t refs;
+    struct grape_drm_device *gdev;
+    u32 local_id;
+    u32 remote_handle;
+};
+
+struct grape_gpu_submission {
+    struct work_struct work;
+    struct completion done;
+    struct grape_drm_device *gdev;
+    struct grape_gpu_context *context;
+    u8 *commands;
+    u32 command_size;
+    u32 command_count;
+    u64 seqno;
+    int status;
+};
+
+struct grape_file {
+    struct grape_drm_device *gdev;
+    struct mutex lock;
+    struct xarray contexts;
+    struct xarray submissions;
+    u32 next_context_id;
 };
 
 struct grape_drm_device {
@@ -68,6 +106,13 @@ struct grape_drm_device {
     u32 display_width;
     u32 display_height;
     u32 pixel_format;
+
+    struct workqueue_struct *gpu_wq;
+    atomic64_t gpu_next_seqno;
+    atomic64_t gpu_completed_seqno;
+    atomic64_t gpu_submitted;
+    atomic64_t gpu_completed;
+    atomic64_t gpu_failed;
 
     void *scanout_pending_buf;
     void *scanout_upload_buf;
@@ -384,6 +429,94 @@ static int grape_gfxlink_get_info(struct grape_drm_device *gdev)
     if (!gdev->display_width || !gdev->display_height)
         return -EINVAL;
 
+    return 0;
+}
+
+static int grape_remote_gpu_context_create(struct grape_drm_device *gdev,
+                                           u32 *out_handle)
+{
+    gfxlink_create_surface_response_t response;
+    u32 size = 0;
+    s32 status;
+    int ret;
+
+    if (!out_handle)
+        return -EINVAL;
+
+    ret = grape_gfxlink_request(gdev, GFXLINK_OP_GPU_CONTEXT_CREATE,
+                                NULL, 0,
+                                &response, sizeof(response), &size);
+    if (ret)
+        return ret;
+    if (size != sizeof(response))
+        return -EPROTO;
+
+    status = grape_wire_s32(response.status);
+    if (status != GFXLINK_STATUS_OK)
+        return grape_status_to_errno(status);
+
+    *out_handle = le32_to_cpu((__le32)response.handle);
+    return *out_handle ? 0 : -EPROTO;
+}
+
+static int grape_remote_gpu_context_destroy(struct grape_drm_device *gdev,
+                                            u32 handle)
+{
+    gfxlink_gpu_context_handle_request_t request = {
+        .handle = cpu_to_le32(handle),
+    };
+
+    if (!handle)
+        return -EINVAL;
+
+    return grape_status_request(gdev, GFXLINK_OP_GPU_CONTEXT_DESTROY,
+                                &request, sizeof(request));
+}
+
+static int grape_remote_gpu_submit(struct grape_drm_device *gdev,
+                                   u32 context_handle,
+                                   u64 submit_id,
+                                   const u8 *commands,
+                                   u32 command_size,
+                                   u32 *out_command_count)
+{
+    gfxlink_gpu_submit_request_t request = {
+        .context_handle = cpu_to_le32(context_handle),
+        .command_size = cpu_to_le32(command_size),
+        .submit_id = cpu_to_le64(submit_id),
+    };
+    gfxlink_gpu_submit_response_t response;
+    u8 *payload;
+    u32 size = 0;
+    s32 status;
+    int ret;
+
+    if (!context_handle || !commands || !command_size ||
+        command_size > GFXLINK_GPU_MAX_COMMAND_BYTES || !out_command_count)
+        return -EINVAL;
+
+    payload = kmalloc(sizeof(request) + command_size, GFP_KERNEL);
+    if (!payload)
+        return -ENOMEM;
+
+    memcpy(payload, &request, sizeof(request));
+    memcpy(payload + sizeof(request), commands, command_size);
+
+    ret = grape_gfxlink_request(gdev, GFXLINK_OP_GPU_SUBMIT,
+                                payload, sizeof(request) + command_size,
+                                &response, sizeof(response), &size);
+    kfree(payload);
+    if (ret)
+        return ret;
+    if (size != sizeof(response) ||
+        le64_to_cpu((__le64)response.submit_id) != submit_id)
+        return -EPROTO;
+
+    status = grape_wire_s32(response.status);
+    if (status != GFXLINK_STATUS_OK)
+        return grape_status_to_errno(status);
+
+    *out_command_count = le32_to_cpu((__le32)response.command_count);
     return 0;
 }
 
@@ -1350,6 +1483,450 @@ out:
     drm_dev_exit(idx);
 }
 
+static void grape_gpu_workqueue_destroy_action(void *data)
+{
+    destroy_workqueue(data);
+}
+
+static void grape_gpu_context_put(struct grape_gpu_context *context)
+{
+    int ret;
+
+    if (!context || !refcount_dec_and_test(&context->refs))
+        return;
+
+    ret = grape_remote_gpu_context_destroy(context->gdev, context->remote_handle);
+    if (ret && ret != -ENODEV && ret != -ECONNRESET && ret != -ESHUTDOWN)
+        dev_warn_ratelimited(&context->gdev->interface->dev,
+                             "GPU context %u remote destroy failed: %d\n",
+                             context->remote_handle, ret);
+    kfree(context);
+}
+
+static int grape_gpu_validate_commands(const u8 *commands,
+                                       u32 command_size,
+                                       u32 *out_command_count)
+{
+    u32 offset = 0;
+    u32 count = 0;
+
+    if (!commands || !out_command_count || !command_size ||
+        command_size > GFXLINK_GPU_MAX_COMMAND_BYTES)
+        return -EINVAL;
+
+    while (offset < command_size) {
+        gfxlink_gpu_command_header_t header;
+        u16 opcode;
+        u16 size;
+        u32 flags;
+
+        if (command_size - offset < sizeof(header))
+            return -EINVAL;
+
+        memcpy(&header, commands + offset, sizeof(header));
+        opcode = le16_to_cpu((__le16)header.opcode);
+        size = le16_to_cpu((__le16)header.size);
+        flags = le32_to_cpu((__le32)header.flags);
+
+        if (size < sizeof(header) || (size & 7U) ||
+            size > command_size - offset || flags)
+            return -EINVAL;
+
+        switch (opcode) {
+        case GFXLINK_GPU_CMD_NOP:
+            if (size != sizeof(header))
+                return -EINVAL;
+            break;
+        default:
+            return -EOPNOTSUPP;
+        }
+
+        offset += size;
+        count++;
+    }
+
+    if (!count)
+        return -EINVAL;
+
+    *out_command_count = count;
+    return 0;
+}
+
+static void grape_gpu_submit_work(struct work_struct *work)
+{
+    struct grape_gpu_submission *submission =
+        container_of(work, struct grape_gpu_submission, work);
+    struct grape_drm_device *gdev = submission->gdev;
+    u32 executed = 0;
+    int idx;
+    int ret;
+
+    if (!drm_dev_enter(&gdev->drm, &idx)) {
+        ret = -ENODEV;
+        goto out_complete;
+    }
+
+    ret = grape_remote_gpu_submit(gdev,
+                                  submission->context->remote_handle,
+                                  submission->seqno,
+                                  submission->commands,
+                                  submission->command_size,
+                                  &executed);
+    drm_dev_exit(idx);
+
+    if (!ret && executed != submission->command_count)
+        ret = -EPROTO;
+
+out_complete:
+    kfree(submission->commands);
+    submission->commands = NULL;
+    WRITE_ONCE(submission->status, ret);
+    atomic64_set(&gdev->gpu_completed_seqno, submission->seqno);
+    if (ret)
+        atomic64_inc(&gdev->gpu_failed);
+    else
+        atomic64_inc(&gdev->gpu_completed);
+    complete_all(&submission->done);
+    grape_gpu_context_put(submission->context);
+    submission->context = NULL;
+}
+
+static int grape_file_store_context(struct grape_file *gfile,
+                                    struct grape_gpu_context *context)
+{
+    u32 start = gfile->next_context_id;
+    int ret;
+
+    do {
+        u32 id = ++gfile->next_context_id;
+
+        if (!id)
+            continue;
+        if (xa_load(&gfile->contexts, id))
+            continue;
+
+        ret = xa_err(xa_store(&gfile->contexts, id, context, GFP_KERNEL));
+        if (ret)
+            return ret;
+        context->local_id = id;
+        return 0;
+    } while (gfile->next_context_id != start);
+
+    return -ENOSPC;
+}
+
+static int grape_drm_open(struct drm_device *drm, struct drm_file *file)
+{
+    struct grape_file *gfile;
+
+    gfile = kzalloc(sizeof(*gfile), GFP_KERNEL);
+    if (!gfile)
+        return -ENOMEM;
+
+    gfile->gdev = to_grape(drm);
+    mutex_init(&gfile->lock);
+    xa_init(&gfile->contexts);
+    xa_init(&gfile->submissions);
+    file->driver_priv = gfile;
+    return 0;
+}
+
+static void grape_drm_postclose(struct drm_device *drm, struct drm_file *file)
+{
+    struct grape_file *gfile = file->driver_priv;
+    struct grape_gpu_context *context;
+    struct grape_gpu_submission *submission;
+    unsigned long index;
+
+    (void)drm;
+    if (!gfile)
+        return;
+
+    mutex_lock(&gfile->lock);
+    xa_for_each(&gfile->contexts, index, context) {
+        xa_erase(&gfile->contexts, index);
+        grape_gpu_context_put(context);
+    }
+    mutex_unlock(&gfile->lock);
+
+    if (gfile->gdev->gpu_wq)
+        flush_workqueue(gfile->gdev->gpu_wq);
+
+    mutex_lock(&gfile->lock);
+    xa_for_each(&gfile->submissions, index, submission) {
+        xa_erase(&gfile->submissions, index);
+        kfree(submission->commands);
+        kfree(submission);
+    }
+    mutex_unlock(&gfile->lock);
+
+    xa_destroy(&gfile->submissions);
+    xa_destroy(&gfile->contexts);
+    mutex_destroy(&gfile->lock);
+    kfree(gfile);
+    file->driver_priv = NULL;
+}
+
+static int grape_get_param_ioctl(struct drm_device *drm,
+                                 void *data,
+                                 struct drm_file *file)
+{
+    struct grape_drm_device *gdev = to_grape(drm);
+    struct drm_grape_get_param *args = data;
+
+    (void)file;
+    if (args->pad)
+        return -EINVAL;
+
+    switch (args->param) {
+    case GRAPE_DRM_PARAM_UAPI_VERSION:
+        args->value = GRAPE_DRM_UAPI_VERSION;
+        return 0;
+    case GRAPE_DRM_PARAM_GFXLINK_VERSION:
+        args->value = gdev->protocol_version;
+        return 0;
+    case GRAPE_DRM_PARAM_GFXLINK_CAPABILITIES:
+        args->value = gdev->capabilities;
+        return 0;
+    case GRAPE_DRM_PARAM_MAX_COMMAND_BYTES:
+        args->value = GFXLINK_GPU_MAX_COMMAND_BYTES;
+        return 0;
+    case GRAPE_DRM_PARAM_COMPLETED_SEQNO:
+        args->value = atomic64_read(&gdev->gpu_completed_seqno);
+        return 0;
+    default:
+        return -EINVAL;
+    }
+}
+
+static int grape_context_create_ioctl(struct drm_device *drm,
+                                      void *data,
+                                      struct drm_file *file)
+{
+    struct grape_drm_device *gdev = to_grape(drm);
+    struct grape_file *gfile = file->driver_priv;
+    struct drm_grape_context_create *args = data;
+    struct grape_gpu_context *context;
+    u32 remote_handle = 0;
+    int ret;
+
+    if (!gfile || args->flags != GRAPE_DRM_CONTEXT_FLAG_NONE)
+        return -EINVAL;
+
+    context = kzalloc(sizeof(*context), GFP_KERNEL);
+    if (!context)
+        return -ENOMEM;
+
+    ret = grape_remote_gpu_context_create(gdev, &remote_handle);
+    if (ret)
+        goto fail_free;
+
+    context->gdev = gdev;
+    context->remote_handle = remote_handle;
+    refcount_set(&context->refs, 1);
+
+    mutex_lock(&gfile->lock);
+    ret = grape_file_store_context(gfile, context);
+    mutex_unlock(&gfile->lock);
+    if (ret)
+        goto fail_remote;
+
+    args->context_id = context->local_id;
+    return 0;
+
+fail_remote:
+    grape_remote_gpu_context_destroy(gdev, remote_handle);
+fail_free:
+    kfree(context);
+    return ret;
+}
+
+static int grape_context_destroy_ioctl(struct drm_device *drm,
+                                       void *data,
+                                       struct drm_file *file)
+{
+    struct grape_file *gfile = file->driver_priv;
+    struct drm_grape_context_destroy *args = data;
+    struct grape_gpu_context *context;
+
+    (void)drm;
+    if (!gfile || !args->context_id || args->pad)
+        return -EINVAL;
+
+    mutex_lock(&gfile->lock);
+    context = xa_erase(&gfile->contexts, args->context_id);
+    mutex_unlock(&gfile->lock);
+    if (!context)
+        return -ENOENT;
+
+    grape_gpu_context_put(context);
+    return 0;
+}
+
+static int grape_gem_create_ioctl(struct drm_device *drm,
+                                  void *data,
+                                  struct drm_file *file)
+{
+    struct drm_grape_gem_create *args = data;
+    struct drm_gem_shmem_object *shmem;
+    size_t size;
+    int ret;
+
+    if (args->flags != GRAPE_DRM_GEM_FLAG_NONE || !args->size ||
+        args->size > SIZE_MAX - (PAGE_SIZE - 1))
+        return -EINVAL;
+
+    size = PAGE_ALIGN((size_t)args->size);
+    shmem = drm_gem_shmem_create(drm, size);
+    if (IS_ERR(shmem))
+        return PTR_ERR(shmem);
+
+    ret = drm_gem_handle_create(file, &shmem->base, &args->handle);
+    if (ret) {
+        drm_gem_object_put(&shmem->base);
+        return ret;
+    }
+
+    args->size = shmem->base.size;
+    args->mmap_offset = drm_vma_node_offset_addr(&shmem->base.vma_node);
+    drm_gem_object_put(&shmem->base);
+    return 0;
+}
+
+static int grape_submit_ioctl(struct drm_device *drm,
+                              void *data,
+                              struct drm_file *file)
+{
+    struct grape_drm_device *gdev = to_grape(drm);
+    struct grape_file *gfile = file->driver_priv;
+    struct drm_grape_submit *args = data;
+    struct grape_gpu_submission *submission;
+    struct grape_gpu_context *context;
+    u8 *commands;
+    u32 command_count = 0;
+    u64 seqno;
+    int ret;
+
+    if (!gfile || args->flags != GRAPE_DRM_SUBMIT_FLAG_NONE || args->pad ||
+        !args->commands || !args->command_size ||
+        args->command_size > GFXLINK_GPU_MAX_COMMAND_BYTES)
+        return -EINVAL;
+
+    commands = memdup_user(u64_to_user_ptr(args->commands), args->command_size);
+    if (IS_ERR(commands))
+        return PTR_ERR(commands);
+
+    ret = grape_gpu_validate_commands(commands, args->command_size,
+                                      &command_count);
+    if (ret)
+        goto fail_commands;
+
+    mutex_lock(&gfile->lock);
+    context = xa_load(&gfile->contexts, args->context_id);
+    if (context && !refcount_inc_not_zero(&context->refs))
+        context = NULL;
+    mutex_unlock(&gfile->lock);
+    if (!context) {
+        ret = -ENOENT;
+        goto fail_commands;
+    }
+
+    submission = kzalloc(sizeof(*submission), GFP_KERNEL);
+    if (!submission) {
+        ret = -ENOMEM;
+        goto fail_context;
+    }
+
+    seqno = atomic64_inc_return(&gdev->gpu_next_seqno);
+    if (!seqno || seqno > ULONG_MAX) {
+        ret = -EOVERFLOW;
+        goto fail_submission;
+    }
+
+    INIT_WORK(&submission->work, grape_gpu_submit_work);
+    init_completion(&submission->done);
+    submission->gdev = gdev;
+    submission->context = context;
+    submission->commands = commands;
+    submission->command_size = args->command_size;
+    submission->command_count = command_count;
+    submission->seqno = seqno;
+    submission->status = -EINPROGRESS;
+
+    mutex_lock(&gfile->lock);
+    ret = xa_err(xa_store(&gfile->submissions, (unsigned long)seqno,
+                          submission, GFP_KERNEL));
+    mutex_unlock(&gfile->lock);
+    if (ret)
+        goto fail_submission;
+
+    atomic64_inc(&gdev->gpu_submitted);
+    queue_work(gdev->gpu_wq, &submission->work);
+    args->seqno = seqno;
+    return 0;
+
+fail_submission:
+    kfree(submission);
+fail_context:
+    grape_gpu_context_put(context);
+fail_commands:
+    kfree(commands);
+    return ret;
+}
+
+static int grape_wait_ioctl(struct drm_device *drm,
+                            void *data,
+                            struct drm_file *file)
+{
+    struct grape_file *gfile = file->driver_priv;
+    struct drm_grape_wait *args = data;
+    struct grape_gpu_submission *submission;
+    long wait_ret;
+
+    (void)drm;
+    if (!gfile || args->flags != GRAPE_DRM_WAIT_FLAG_NONE || !args->seqno ||
+        args->seqno > ULONG_MAX || args->timeout_ns < -1)
+        return -EINVAL;
+
+    mutex_lock(&gfile->lock);
+    submission = xa_load(&gfile->submissions, (unsigned long)args->seqno);
+    mutex_unlock(&gfile->lock);
+    if (!submission)
+        return -ENOENT;
+
+    if (args->timeout_ns == 0) {
+        if (!completion_done(&submission->done))
+            return -ETIME;
+    } else if (args->timeout_ns < 0) {
+        wait_ret = wait_for_completion_interruptible(&submission->done);
+        if (wait_ret)
+            return wait_ret;
+    } else {
+        unsigned long timeout = nsecs_to_jiffies((u64)args->timeout_ns);
+
+        if (!timeout)
+            timeout = 1;
+        wait_ret = wait_for_completion_interruptible_timeout(&submission->done,
+                                                              timeout);
+        if (wait_ret < 0)
+            return wait_ret;
+        if (!wait_ret)
+            return -ETIME;
+    }
+
+    args->status = READ_ONCE(submission->status);
+    return 0;
+}
+
+static const struct drm_ioctl_desc grape_drm_ioctls[] = {
+    DRM_IOCTL_DEF_DRV(GRAPE_GET_PARAM, grape_get_param_ioctl, DRM_RENDER_ALLOW),
+    DRM_IOCTL_DEF_DRV(GRAPE_CONTEXT_CREATE, grape_context_create_ioctl, DRM_RENDER_ALLOW),
+    DRM_IOCTL_DEF_DRV(GRAPE_CONTEXT_DESTROY, grape_context_destroy_ioctl, DRM_RENDER_ALLOW),
+    DRM_IOCTL_DEF_DRV(GRAPE_GEM_CREATE, grape_gem_create_ioctl, DRM_RENDER_ALLOW),
+    DRM_IOCTL_DEF_DRV(GRAPE_SUBMIT, grape_submit_ioctl, DRM_RENDER_ALLOW),
+    DRM_IOCTL_DEF_DRV(GRAPE_WAIT, grape_wait_ioctl, DRM_RENDER_ALLOW),
+};
+
 static enum drm_connector_status
 grape_connector_detect(struct drm_connector *connector, bool force)
 {
@@ -1505,14 +2082,18 @@ static int grape_modeset_init(struct grape_drm_device *gdev)
 DEFINE_DRM_GEM_FOPS(grape_drm_fops);
 
 static const struct drm_driver grape_drm_driver = {
-    .driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
+    .driver_features = DRIVER_GEM | DRIVER_RENDER | DRIVER_MODESET | DRIVER_ATOMIC,
+    .open = grape_drm_open,
+    .postclose = grape_drm_postclose,
     .fops = &grape_drm_fops,
+    .ioctls = grape_drm_ioctls,
+    .num_ioctls = ARRAY_SIZE(grape_drm_ioctls),
     DRM_GEM_SHMEM_DRIVER_OPS,
     .name = "grape",
     .desc = GRAPE_DRM_DESC,
     .major = 0,
-    .minor = 5,
-    .patchlevel = 1,
+    .minor = 6,
+    .patchlevel = 0,
 };
 
 static int grape_usb_probe(struct usb_interface *interface,
@@ -1580,12 +2161,28 @@ static int grape_usb_probe(struct usb_interface *interface,
         !(gdev->capabilities & GFXLINK_CAP_TEXTURES) ||
         !(gdev->capabilities & GFXLINK_CAP_TEXTURE_UPDATE) ||
         !(gdev->capabilities & GFXLINK_CAP_TEXTURE_WRITE_RECT) ||
-        !(gdev->capabilities & GFXLINK_CAP_EXPLICIT_PRESENT)) {
-        dev_err(dev, "firmware lacks M3.2b scanout capabilities (caps=0x%08x)\n",
+        !(gdev->capabilities & GFXLINK_CAP_EXPLICIT_PRESENT) ||
+        !(gdev->capabilities & GFXLINK_CAP_GPU_SUBMIT)) {
+        dev_err(dev, "firmware lacks M4.0 capabilities (caps=0x%08x)\n",
                 gdev->capabilities);
         ret = -EOPNOTSUPP;
         goto err_clear;
     }
+
+    gdev->gpu_wq = alloc_ordered_workqueue(GRAPE_GPU_WORKQUEUE_NAME, WQ_MEM_RECLAIM);
+    if (!gdev->gpu_wq) {
+        ret = -ENOMEM;
+        goto err_clear;
+    }
+    ret = devm_add_action_or_reset(dev, grape_gpu_workqueue_destroy_action,
+                                   gdev->gpu_wq);
+    if (ret)
+        goto err_clear;
+    atomic64_set(&gdev->gpu_next_seqno, 0);
+    atomic64_set(&gdev->gpu_completed_seqno, 0);
+    atomic64_set(&gdev->gpu_submitted, 0);
+    atomic64_set(&gdev->gpu_completed, 0);
+    atomic64_set(&gdev->gpu_failed, 0);
 
     if (gdev->display_width > SIZE_MAX / 2 ||
         gdev->display_height > SIZE_MAX / ((size_t)gdev->display_width * 2)) {
@@ -1674,7 +2271,7 @@ static int grape_usb_probe(struct usb_interface *interface,
     }
 
     dev_info(dev,
-             "GRAPE GFXLINK v%u connected: %ux%u format=%u caps=0x%08x; 32x32 diff + direct texture-write scanout ready\n",
+             "GRAPE GFXLINK v%u connected: %ux%u format=%u caps=0x%08x; M4.0 render node + GPU submit ready\n",
              gdev->protocol_version, gdev->display_width, gdev->display_height,
              gdev->pixel_format, gdev->capabilities);
     return 0;
@@ -1717,9 +2314,11 @@ static void grape_usb_disconnect(struct usb_interface *interface)
     if (physically_gone)
         WRITE_ONCE(gdev->disconnected, true);
 
-    cancel_work_sync(&gdev->scanout_work);
-
     drm_dev_unplug(&gdev->drm);
+    cancel_work_sync(&gdev->scanout_work);
+    if (gdev->gpu_wq)
+        flush_workqueue(gdev->gpu_wq);
+
     drm_atomic_helper_shutdown(&gdev->drm);
 
     if (!physically_gone)
@@ -1728,15 +2327,16 @@ static void grape_usb_disconnect(struct usb_interface *interface)
     WRITE_ONCE(gdev->disconnected, true);
 
     dev_info(&interface->dev,
-             "GRAPE GFXLINK disconnected (submitted=%llu uploaded=%llu dropped=%llu unchanged=%llu rects=%llu bytes=%llu dirty_tiles=%llu full=%llu merges=%llu fast_packets=%llu)\n",
+             "GRAPE GFXLINK disconnected (scanout submitted=%llu uploaded=%llu dropped=%llu unchanged=%llu rects=%llu bytes=%llu dirty_tiles=%llu full=%llu merges=%llu fast_packets=%llu; gpu submitted=%lld completed=%lld failed=%lld seq=%lld)\n",
              gdev->scanout_submitted, gdev->scanout_uploaded,
              gdev->scanout_dropped, gdev->scanout_unchanged,
              gdev->scanout_rects_uploaded, gdev->scanout_bytes_uploaded,
              gdev->scanout_dirty_tiles, gdev->scanout_full_fallbacks,
-             gdev->scanout_rect_merges, gdev->scanout_fast_packets);
-
-    mutex_destroy(&gdev->scanout_lock);
-    mutex_destroy(&gdev->io_lock);
+             gdev->scanout_rect_merges, gdev->scanout_fast_packets,
+             atomic64_read(&gdev->gpu_submitted),
+             atomic64_read(&gdev->gpu_completed),
+             atomic64_read(&gdev->gpu_failed),
+             atomic64_read(&gdev->gpu_completed_seqno));
     usb_put_dev(gdev->udev);
 }
 
@@ -1758,4 +2358,4 @@ module_usb_driver(grape_usb_driver);
 MODULE_AUTHOR("GRAPE project");
 MODULE_DESCRIPTION(GRAPE_DRM_DESC);
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.5.2");
+MODULE_VERSION("0.6.0");

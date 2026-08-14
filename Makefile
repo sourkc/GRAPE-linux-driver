@@ -24,7 +24,7 @@ LIBGRAPE := libgrape.a
 
 .PHONY: all clean module module-clean install-module uninstall-module install-udev uninstall-udev
 
-all: grapectl
+all: grapectl grape-gpu-smoke
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -38,8 +38,11 @@ $(LIBGRAPE): $(LIBGRAPE_OBJ)
 grapectl: src/grapectl.c $(LIBGRAPE) include/grape/grape.h
 	$(CC) $(CPPFLAGS) $(GRAPECTL_CPPFLAGS) $(CFLAGS) -std=gnu11 -o $@ src/grapectl.c $(LIBGRAPE) $(LDLIBS) $(GRAPECTL_LDLIBS)
 
+grape-gpu-smoke: src/grape_gpu_smoke.c include/grape/grape_drm.h include/grape/gfxlink_protocol.h
+	$(CC) -Iinclude $(CFLAGS) -std=gnu11 -o $@ src/grape_gpu_smoke.c
+
 clean:
-	rm -rf $(BUILD_DIR) $(LIBGRAPE) grapectl
+	rm -rf $(BUILD_DIR) $(LIBGRAPE) grapectl grape-gpu-smoke
 
 module:
 	@if [ -n "$(KBUILD_TOOLCHAIN)" ]; then echo "Kernel toolchain: $(KBUILD_TOOLCHAIN) (auto-detected)"; fi

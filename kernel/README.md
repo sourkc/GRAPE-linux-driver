@@ -2,32 +2,32 @@
 
 `grape_drm` is the kernel-side GFXLINK driver.
 
-M3.2b keeps the 32x32 framebuffer-diff fallback from M3.2a, but removes the
-latency-heavy generic resource lifecycle from dumb scanout. Small framebuffer
-updates are now written directly into the persistent remote scanout texture with
-GFXLINK v6 `TEXTURE_WRITE_RECT` packets. The packets are fire-and-forget USB
-bulk transfers; one normal `PRESENT` response at the end of the batch reports
-any deferred firmware-side write error.
+M4.0 keeps the M3.2b dumb-scanout fallback and adds the first render-side DRM
+ABI. The driver now advertises `DRIVER_RENDER`, so DRM creates a
+`/dev/dri/renderD*` node in addition to the KMS primary node. Render-only private
+ioctls are marked `DRM_RENDER_ALLOW`.
 
-The worker still compares the newest coherent RGB565 frame with a second RGB565
-shadow representing what was successfully presented on the P4. Dirty 32x32 tile
-runs are merged into at most eight upload rectangles. Large or highly fragmented
-changes fall back to a full-screen update. The baseline advances only after the
-rectangle writes and `PRESENT` succeed, so dropped KWin frames cannot hide
-changes.
+The M4.0 render ABI provides:
 
-On the firmware side, direct texture writes are accumulated until `PRESENT`. The
-renderer then invalidates only the changed texture regions before presenting.
-For the 1:1 fullscreen scanout surface this keeps both USB traffic and GRAPE
-renderer damage local instead of invalidating the whole 720x1280 surface for
-every cursor movement.
+- device parameter queries;
+- per-file GRAPE GPU contexts;
+- shmem GEM buffer objects with mmap offsets;
+- asynchronous command submission through an ordered kernel workqueue;
+- monotonically increasing submission sequence numbers and a wait ioctl.
 
-The atomic commit path performs no USB I/O. It only converts/snapshots the latest
-framebuffer into the two-buffer mailbox; stale pending frames are replaced by the
-newest one rather than queued.
+The only command accepted by M4.0 is an 8-byte `NOP`. This is intentional: it
+proves the full userspace -> render node -> DRM ioctl -> kernel queue -> GFXLINK
+v7 -> P4 parser -> completion path before rendering commands and resource
+bindings are added in later milestones.
 
-The primary plane remains fixed 1:1 fullscreen scanout. GRAPE does not currently
-implement scaling, cropping, or plane positioning.
+GFXLINK v7 adds GPU context create/destroy and GPU submit operations. P4 GPU
+contexts are dynamically allocated linked-list objects rather than another
+small fixed-size object table. M4.0 submissions are validated independently by
+both the kernel and firmware.
+
+The existing KMS path still uses the 32x32 framebuffer-diff fallback from
+M3.2b. Small framebuffer updates are written directly into the persistent
+remote scanout texture with `TEXTURE_WRITE_RECT`, followed by one `PRESENT`.
 
 ## Build
 
@@ -39,54 +39,48 @@ make module
 ```
 
 The top-level Makefile checks the running kernel's generated config. If the
-kernel was built with Clang (as CachyOS commonly is), it automatically passes
-`LLVM=1` to Kbuild so the external module uses the matching compiler family.
-You can override this with `KBUILD_TOOLCHAIN=...` if necessary.
+kernel was built with Clang, it automatically passes `LLVM=1` to Kbuild.
+
+`make` also builds `grape-gpu-smoke`, a userspace M4.0 render-node test.
 
 ## Test
 
-Load the matching GFXLINK v6 firmware first, then load the module:
+Flash matching GFXLINK v7 firmware first, then load the module:
 
 ```sh
 sudo insmod kernel/grape_drm.ko
 sudo dmesg | tail -n 50
-modetest -M grape -c
-modetest -M grape -p
+ls -l /dev/dri
 ```
 
 The connect log should include:
 
 ```text
-32x32 diff + direct texture-write scanout ready
+M4.0 render node + GPU submit ready
 ```
 
-KWin/Plasma can then use the display normally. Cursor movement, hover changes,
-terminal output, and other small updates should transfer only the dirty
-rectangles without creating, committing, updating from, and destroying a
-temporary GFXLINK resource for every rectangle.
-
-For an explicit modeset test, use the connector and CRTC IDs reported by
-`modetest`:
+There should be a GRAPE `renderD*` node. Run:
 
 ```sh
-modetest -M grape -s <connector_id>@<crtc_id>:720x1280-60
+./grape-gpu-smoke
 ```
 
-On disconnect the driver logs submitted/uploaded/dropped frames, unchanged
-frames, uploaded rectangles and bytes, total dirty tiles, full-frame fallbacks,
-rectangle merges, and the number of direct texture-write packets.
+The tool auto-detects the GRAPE render node. It queries the UAPI, creates a GPU
+context, creates and mmaps a 4 KiB GEM object, submits 64 NOP commands, waits for
+the P4 to validate/complete the submission, and destroys the context.
 
-Unload the module to return the USB interface to `libusb`/`grapectl`:
+You can also specify the render node explicitly:
 
 ```sh
-sudo rmmod grape_drm
+./grape-gpu-smoke /dev/dri/renderD129
 ```
 
-To install it for the running kernel:
+The KMS/display side remains available through the primary node and can still be
+inspected with:
 
 ```sh
-sudo make install-module
-sudo modprobe grape_drm
+modetest -M grape -c
+modetest -M grape -p
 ```
 
 The kernel module source in this directory is GPL-2.0-only. The userspace
